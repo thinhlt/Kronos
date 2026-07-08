@@ -208,6 +208,11 @@ class CustomFinetuneConfig:
         self.adam_weight_decay = training_config.get('adam_weight_decay', 0.1)
         self.accumulation_steps = training_config.get('accumulation_steps', 1)
 
+        # Mixed precision (AMP) training: 'fp16' needs gradient scaling
+        # (GradScaler) to avoid underflow, 'bf16' does not.
+        self.use_amp = training_config.get('use_amp', False)
+        self.amp_dtype = training_config.get('amp_dtype', 'fp16')
+
         model_paths = self.loader.get_model_paths()
         self.exp_name = model_paths.get('exp_name', 'default_experiment')
         self.pretrained_tokenizer_path = model_paths.get('pretrained_tokenizer')

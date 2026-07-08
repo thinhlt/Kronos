@@ -304,6 +304,15 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
         div_factor=10
     )
 
+    # Mixed precision: only meaningful on CUDA. fp16 needs a GradScaler to
+    # avoid gradient underflow; bf16 has fp32's exponent range so the scaler
+    # is created disabled (a no-op) in that case.
+    use_amp = bool(getattr(config, 'use_amp', False)) and device.type == 'cuda'
+    amp_dtype = torch.bfloat16 if getattr(config, 'amp_dtype', 'fp16') == 'bf16' else torch.float16
+    scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
+    if rank == 0:
+        print(f"Mixed precision (AMP): {use_amp} (dtype: {amp_dtype if use_amp else 'n/a'})")
+
     if use_ddp:
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
@@ -333,13 +342,16 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
             token_in = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
             token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
 
-            logits = (model.module if use_ddp else model)(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
-            loss, s1_loss, s2_loss = (model.module if use_ddp else model).head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                logits = (model.module if use_ddp else model)(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
+                loss, s1_loss, s2_loss = (model.module if use_ddp else model).head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
 
             optimizer.zero_grad()
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_((model.module if use_ddp else model).parameters(), max_norm=3.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
 
             epoch_train_loss += loss.item()
@@ -368,8 +380,9 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
                 token_in = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
                 token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
 
-                logits = (model.module if use_ddp else model)(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
-                loss, _, _ = (model.module if use_ddp else model).head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                    logits = (model.module if use_ddp else model)(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
+                    loss, _, _ = (model.module if use_ddp else model).head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
 
                 val_loss += loss.item()
                 val_batches += 1
@@ -454,6 +467,7 @@ def main():
     logger.info(f"Learning rate: {config.predictor_learning_rate}")
     logger.info(f"Training epochs: {config.basemodel_epochs}")
     logger.info(f"Device: {device}")
+    logger.info(f"Mixed precision (AMP): {config.use_amp} (dtype: {config.amp_dtype})")
     logger.info(f"Tokenizer path: {config.finetuned_tokenizer_path}")
     logger.info(f"Pretrained model path: {config.pretrained_predictor_path}")
 
