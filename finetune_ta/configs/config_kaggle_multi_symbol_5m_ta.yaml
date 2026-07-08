@@ -1,0 +1,116 @@
+# Template config for finetuning Kronos on Kaggle, jointly across multiple
+# crypto symbols' 5m OHLCV+indicator CSVs (produced by download_data.py ->
+# clean_merge_data.py -> prepare_dataset.py). See ../README.md for the full
+# Kaggle setup/resume workflow.
+
+data:
+  # Glob pattern (or an explicit YAML list of paths) matching every symbol's
+  # indicator-augmented CSV. Each file is treated as an independent series --
+  # a training window is never built from more than one file. Adjust the
+  # repo root if you cloned/uploaded Kronos somewhere other than
+  # /kaggle/working/Kronos.
+  data_path: "/kaggle/input/datasets/thinhlt68/binance-kline/*_kline_5min.csv"
+  # Equivalent explicit form, if you'd rather pin the exact symbol set:
+  # data_path:
+  #   - "/kaggle/working/Kronos/finetune_ta/data/BTCUSDT_kline_5min.csv"
+  #   - "/kaggle/working/Kronos/finetune_ta/data/ETHUSDT_kline_5min.csv"
+  #   - "/kaggle/working/Kronos/finetune_ta/data/BNBUSDT_kline_5min.csv"
+  #   - "/kaggle/working/Kronos/finetune_ta/data/SOLUSDT_kline_5min.csv"
+  #   - "/kaggle/working/Kronos/finetune_ta/data/XRPUSDT_kline_5min.csv"
+  #   - "/kaggle/working/Kronos/finetune_ta/data/ADAUSDT_kline_5min.csv"
+  #   - "/kaggle/working/Kronos/finetune_ta/data/DOGEUSDT_kline_5min.csv"
+  #   - "/kaggle/working/Kronos/finetune_ta/data/TRXUSDT_kline_5min.csv"
+  #   - "/kaggle/working/Kronos/finetune_ta/data/ZECUSDT_kline_5min.csv"
+  #   - "/kaggle/working/Kronos/finetune_ta/data/AVAXUSDT_kline_5min.csv"
+  lookback_window: 512
+  predict_window: 48
+  max_context: 512
+  clip: 5.0
+  # split ratio is applied PER FILE (each symbol contributes its own last
+  # 10% of bars to validation), not by holding out whole symbols.
+  train_ratio: 0.9
+  val_ratio: 0.1
+  test_ratio: 0.0
+
+features:
+  indicators:
+    heikin_ashi: true
+    kdj: true
+    macd: true
+    bollinger: true
+
+training:
+  tokenizer_epochs: 30
+  basemodel_epochs: 20
+  # Kaggle GPUs (T4 x1/x2, P100) have less memory than typical workstation
+  # GPUs -- drop this further if you hit OOM.
+  batch_size: 64
+  log_interval: 50
+  # Kaggle notebooks have 4 CPU cores; more workers than that just contend.
+  num_workers: 2
+  seed: 42
+
+  tokenizer_learning_rate: 0.0002
+  predictor_learning_rate: 0.000001
+
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_weight_decay: 0.1
+  accumulation_steps: 1
+
+  # Kaggle sessions are capped (~9-12h interactive, 30 GPU-hrs/week quota) and
+  # /kaggle/working is wiped on a fresh session -- resume=true makes it safe
+  # to just re-run this same command in a new session, as long as
+  # base_save_path (or resume_from_path, see model_paths below) still has the
+  # previous session's checkpoint_last.pt. checkpoint_every_n_steps also
+  # saves mid-epoch, in case a session is cut off before finishing one.
+  resume: true
+  checkpoint_every_n_steps: 500
+
+  # Mixed precision (AMP) training: speeds up training and reduces memory use
+  # on Kaggle's T4/P100 GPUs by running most ops in fp16. 'fp16' works on
+  # T4/P100 (uses gradient scaling); 'bf16' needs Ampere-or-newer, which
+  # Kaggle's free-tier GPUs are not, so leave this as 'fp16' there.
+  use_amp: true
+  amp_dtype: "fp16"
+
+model_paths:
+  pretrained_tokenizer: "NeoQuasar/Kronos-Tokenizer-base"
+  pretrained_predictor: "NeoQuasar/Kronos-base"
+
+  exp_name: "kaggle_multi_symbol_5m_ta"
+  base_path: "/kaggle/working/Kronos/finetune_ta/finetuned/"
+
+  base_save_path: ""
+  finetuned_tokenizer: ""
+
+  tokenizer_save_name: "tokenizer"
+  basemodel_save_name: "basemodel"
+
+  # Set this to resume a run that started in a PREVIOUS Kaggle session:
+  # 1. After a session ends, "Save Version" so /kaggle/working becomes a
+  #    Kaggle Dataset/output you can attach as input to the next session.
+  # 2. Add that output as a Notebook input (Kaggle mounts it read-only under
+  #    /kaggle/input/<slug>/...).
+  # 3. Point resume_from_path at the experiment directory inside it, e.g.:
+  #      resume_from_path: "/kaggle/input/<slug>/Kronos/finetune_ta/finetuned/kaggle_multi_symbol_5m_ta"
+  # On startup, if base_save_path has no progress yet, its contents are
+  # copied in once so training resumes from the checkpoint as usual and new
+  # checkpoints are written to the writable base_save_path.
+  resume_from_path: ""
+
+experiment:
+  name: "kronos_kaggle_multi_symbol_ta"
+  description: "Multi-symbol (10 USDT pairs) technical-indicator finetune, tuned for Kaggle Notebook sessions"
+  use_comet: false
+
+  train_tokenizer: true
+  train_basemodel: true
+  skip_existing: false
+
+  pre_trained_tokenizer: false
+  pre_trained_predictor: true
+
+device:
+  use_cuda: true
+  device_id: 0

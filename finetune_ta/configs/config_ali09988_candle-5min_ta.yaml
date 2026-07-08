@@ -1,0 +1,99 @@
+#This is a template config for finetuning kronos on CSV data augmented with technical indicators.
+#这是一份模板config，用于kronos在带技术指标的csv自定义数据上进行微调
+
+data:
+  data_path: "/Users/macintosh/Prj/Kronos/finetune_ta/data/HK_ali_09988_kline_5min_all.csv"
+  lookback_window: 512
+  predict_window: 48
+  max_context: 512
+  clip: 5.0
+  # dataset split ratio
+  train_ratio: 0.9
+  val_ratio: 0.1
+  test_ratio: 0.0
+
+# which technical indicators to add as extra feature columns, on top of the
+# base open/high/low/close/volume/amount columns. Each indicator's internal
+# parameters (periods, etc.) are fixed to industry-standard defaults in
+# indicators.py -- only enable/disable is configurable here.
+features:
+  indicators:
+    heikin_ashi: true   # adds ha_open, ha_high, ha_low, ha_close
+    kdj: true            # adds K_9_3, D_9_3, J_9_3
+    macd: true            # adds MACD_12_26_9, MACDh_12_26_9, MACDs_12_26_9
+    bollinger: true        # adds BBB_20_2.0 (bandwidth), BBP_20_2.0 (%B)
+
+training:
+  # control the training epochs of tokenizer and basemodel
+  tokenizer_epochs: 30
+  basemodel_epochs: 20
+  batch_size: 32
+  log_interval: 50
+  num_workers: 6
+  seed: 42
+
+  tokenizer_learning_rate: 0.0002
+  predictor_learning_rate: 0.000001
+
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_weight_decay: 0.1
+
+  # gradient accumulation steps for tokenizer training
+  accumulation_steps: 1
+
+  # Mixed precision (AMP) training: speeds up training and reduces memory use
+  # on CUDA GPUs by running most ops in a lower-precision dtype. No effect on
+  # CPU. 'fp16' works on most GPUs (uses gradient scaling); 'bf16' needs
+  # Ampere-or-newer (RTX 30xx+/A100) but needs no scaling.
+  use_amp: false
+  amp_dtype: "fp16"
+
+# model path configuration
+model_paths:
+  # pretrained model path (used for the predictor; the tokenizer is trained
+  # from scratch since d_in no longer matches the pretrained tokenizer -- see
+  # docs/adr/0001-technical-indicator-tokenizer-from-scratch.md)
+  pretrained_tokenizer: "NeoQuasar/Kronos-Tokenizer-base"
+  pretrained_predictor: "NeoQuasar/Kronos-base"
+
+  # experiment name - other paths will be generated based on this
+  exp_name: "HK_ali_09988_kline_5min_ta"
+  base_path: "/Users/macintosh/Prj/Kronos/finetune_ta/finetuned/"
+
+  # the following paths will be generated based on exp_name, no need to modify manually
+  # way 1: leave empty string, the system will generate the full path
+  base_save_path: ""  #  /xxxx/Kronos/finetune_ta/finetuned/{exp_name}
+  finetuned_tokenizer: ""  # /xxxx/Kronos/finetune_ta/finetuned/{exp_name}/tokenizer/best_model
+
+  # way 2: use template string, {exp_name} will be replaced with the actual experiment name
+  # base_save_path: "/xxxx/Kronos/finetune_ta/finetuned/{exp_name}"
+  # finetuned_tokenizer: "/xxxx/Kronos/finetune_ta/finetuned/{exp_name}/tokenizer/best_model"
+
+  tokenizer_save_name: "tokenizer"
+  basemodel_save_name: "basemodel"
+
+experiment:
+  name: "kronos_ta_finetune"
+  description: "Technical-indicator-augmented finetune for HK stock data (KDJ, MACD, Heikin-Ashi, Bollinger)"
+  use_comet: false
+
+  # control the training phase
+  train_tokenizer: true
+  train_basemodel: true
+
+  # if true, skip the existing model training
+  skip_existing: false
+
+  # tokenizer must be trained from scratch: d_in changes whenever the
+  # indicator set above changes, so the pretrained tokenizer's weights
+  # (d_in=6) cannot be reused.
+  pre_trained_tokenizer: false
+  # predictor is token-based (no direct dependency on d_in), so the
+  # pretrained predictor weights remain valid.
+  pre_trained_predictor: true
+
+# device configuration
+device:
+  use_cuda: true
+  device_id: 0
