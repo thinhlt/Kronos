@@ -213,6 +213,14 @@ class CustomFinetuneConfig:
         self.use_amp = training_config.get('use_amp', False)
         self.amp_dtype = training_config.get('amp_dtype', 'fp16')
 
+        # Resumable Checkpoint: `resume=true` auto-continues from
+        # `checkpoint_last.pt` in the save dir if one exists (see
+        # checkpoint_utils.py / docs/adr/0003). `checkpoint_every_n_steps`
+        # additionally saves mid-epoch as a safety net for sessions that can
+        # be cut off (e.g. Kaggle/Colab time limits).
+        self.resume = training_config.get('resume', True)
+        self.checkpoint_every_n_steps = training_config.get('checkpoint_every_n_steps', 0)
+
         model_paths = self.loader.get_model_paths()
         self.exp_name = model_paths.get('exp_name', 'default_experiment')
         self.pretrained_tokenizer_path = model_paths.get('pretrained_tokenizer')

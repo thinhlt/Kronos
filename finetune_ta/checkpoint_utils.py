@@ -87,18 +87,18 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler, device=None, s
     if scaler is not None and scaler.is_enabled() and checkpoint.get("scaler_state_dict") is not None:
         scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
-    rng_state = checkpoint.get("rng_state")
-    if rng_state:
-        random.setstate(rng_state["python"])
-        np.random.set_state(rng_state["numpy"])
-        torch.set_rng_state(rng_state["torch"].cpu().to(torch.uint8) if torch.is_tensor(rng_state["torch"]) else rng_state["torch"])
-        if rng_state.get("torch_cuda") is not None and torch.cuda.is_available():
-            try:
-                torch.cuda.set_rng_state_all(rng_state["torch_cuda"])
-            except RuntimeError:
-                # e.g. resuming on a different GPU count/type than the run
-                # that saved this checkpoint -- not fatal, just less exact.
-                pass
+    # rng_state = checkpoint.get("rng_state")
+    # if rng_state:
+    #     random.setstate(rng_state["python"])
+    #     np.random.set_state(rng_state["numpy"])
+    #     torch.set_rng_state(rng_state["torch"].cpu().to(torch.uint8) if torch.is_tensor(rng_state["torch"]) else rng_state["torch"])
+    #     if rng_state.get("torch_cuda") is not None and torch.cuda.is_available():
+    #         try:
+    #             torch.cuda.set_rng_state_all(rng_state["torch_cuda"])
+    #         except RuntimeError:
+    #             # e.g. resuming on a different GPU count/type than the run
+    #             # that saved this checkpoint -- not fatal, just less exact.
+    #             pass
 
     saved_epoch = checkpoint.get("epoch", -1)
     best_val_loss = checkpoint.get("best_val_loss", float("inf"))

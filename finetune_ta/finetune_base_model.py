@@ -15,6 +15,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 sys.path.append('../')
 from indicators import BASE_FEATURES, ensure_features
 from model_factory import load_finetuned_tokenizer
+from checkpoint_utils import find_checkpoint, load_checkpoint, save_checkpoint
 
 
 class CustomKlineDataset(Dataset):
@@ -313,14 +314,33 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
     if rank == 0:
         print(f"Mixed precision (AMP): {use_amp} (dtype: {amp_dtype if use_amp else 'n/a'})")
 
+    start_epoch = 0
+    best_val_loss = float('inf')
+    if getattr(config, 'resume', True):
+        checkpoint_path = find_checkpoint(save_dir)
+        if checkpoint_path:
+            start_epoch, best_val_loss = load_checkpoint(checkpoint_path, model, optimizer, scheduler, device=device, scaler=scaler)
+            msg = (f"Resuming basemodel training from {checkpoint_path}: starting at epoch "
+                   f"{start_epoch + 1}/{config.basemodel_epochs}, best_val_loss so far {best_val_loss:.4f}")
+            logger.info(msg)
+            if rank == 0:
+                print(msg)
+
+    if start_epoch >= config.basemodel_epochs:
+        msg = f"Checkpoint already completed all {config.basemodel_epochs} configured epochs, nothing to resume"
+        logger.info(msg)
+        if rank == 0:
+            print(msg)
+        return best_val_loss
+
     if use_ddp:
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
-    best_val_loss = float('inf')
-    batch_idx_global = 0
+    batch_idx_global = start_epoch * len(train_loader)
+    checkpoint_every_n_steps = getattr(config, 'checkpoint_every_n_steps', 0)
 
-    for epoch in range(config.basemodel_epochs):
+    for epoch in range(start_epoch, config.basemodel_epochs):
         epoch_start_time = time.time()
         model.train()
 
@@ -366,6 +386,14 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
                     print(log_msg)
 
             batch_idx_global += 1
+
+            if checkpoint_every_n_steps > 0 and rank == 0 and batch_idx_global % checkpoint_every_n_steps == 0:
+                # Mid-epoch safety net: record the *previous* completed epoch as the
+                # resume point (not the in-progress one), so resuming just re-runs
+                # the interrupted epoch from its start rather than attempting exact
+                # mid-epoch resumption.
+                save_checkpoint(save_dir, model, optimizer, scheduler, epoch - 1, best_val_loss,
+                                 extra={'mid_epoch_step': batch_idx_global}, scaler=scaler)
 
         model.eval()
         val_loss = 0.0
@@ -418,6 +446,12 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
                 save_msg = f"Best model saved to: {model_save_path} (validation loss: {best_val_loss:.4f})"
                 logger.info(save_msg)
                 print(save_msg)
+
+        if rank == 0:
+            checkpoint_path = save_checkpoint(save_dir, model, optimizer, scheduler, epoch, best_val_loss, scaler=scaler)
+            resume_msg = f"Checkpoint saved to: {checkpoint_path} (resume point: epoch {epoch + 1}/{config.basemodel_epochs})"
+            logger.info(resume_msg)
+            print(resume_msg)
 
     return best_val_loss
 
