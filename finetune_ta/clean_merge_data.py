@@ -111,6 +111,10 @@ def merge_symbol(symbol: str, output_dir: str) -> bool:
     print(f"{symbol}: merged {len(months)} month file(s), {len(merged)} rows, {span} -> {output_path}")
     return True
 
+def clean_merge_file(input_file: str, output_file: str):
+    df = load_raw_month(input_file)
+    df.to_csv(output_file, index=False)
+    return True
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -118,6 +122,10 @@ def parse_args():
     )
     parser.add_argument("--symbols", nargs="+", default=DEFAULT_SYMBOLS,
                          help=f"Symbols to merge (default: {DEFAULT_SYMBOLS})")
+    parser.add_argument("--input",
+                         help=f"Input file to merge")
+    parser.add_argument("--output",
+                         help=f"Output file to merge")
     parser.add_argument("--output-dir", default=DATA_DIR,
                          help=f"Where to write merged per-symbol CSVs (default: {DATA_DIR})")
     return parser.parse_args()
@@ -128,11 +136,14 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     ok = 0
-    for symbol in args.symbols:
-        if merge_symbol(symbol, args.output_dir):
-            ok += 1
-
-    print(f"\nDone: {ok}/{len(args.symbols)} symbols merged")
+    if args.input:
+        clean_merge_file(args.input, args.output)
+        print(f"\nDone: {args.input} merged to {args.output}")
+    else:
+        for symbol in args.symbols:
+            if merge_symbol(symbol, args.output_dir):
+                ok += 1
+        print(f"\nDone: {ok} files merged")
 
 
 if __name__ == "__main__":

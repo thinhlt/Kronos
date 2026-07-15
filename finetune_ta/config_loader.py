@@ -151,18 +151,25 @@ class ConfigLoader:
 
 class CustomFinetuneConfig:
 
-    def __init__(self, config_path: str = None):
+    def __init__(self, config_path: str = None, data_path_override=None):
 
         if config_path is None:
             config_path = os.path.join(os.path.dirname(__file__), 'config.yaml')
 
         self.loader = ConfigLoader(config_path)
+        self._data_path_override = data_path_override
         self._load_all_configs()
 
     def _load_all_configs(self):
 
         data_config = self.loader.get_data_config()
-        self.data_path = data_config.get('data_path')
+        # Optional override lets inference scripts pass --input without requiring
+        # the config's (possibly remote/Colab) data_path to exist on disk.
+        self.data_path = (
+            self._data_path_override
+            if self._data_path_override is not None
+            else data_config.get('data_path')
+        )
         # Resolve globs/lists into concrete file paths eagerly, at config load
         # time, so a bad/unmounted data_path (e.g. Google Drive not mounted
         # in Colab, or a typo'd directory) fails fast with a clear message

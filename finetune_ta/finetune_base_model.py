@@ -316,12 +316,18 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
 
     start_epoch = 0
     best_val_loss = float('inf')
+    global_step = 0
     if getattr(config, 'resume', True):
         checkpoint_path = find_checkpoint(save_dir)
         if checkpoint_path:
-            start_epoch, best_val_loss = load_checkpoint(checkpoint_path, model, optimizer, scheduler, device=device, scaler=scaler)
+            start_epoch, best_val_loss, global_step = load_checkpoint(checkpoint_path, model, optimizer, scheduler, device=device, scaler=scaler)
+            if global_step is None:
+                # Older checkpoint predating global_step tracking -- approximate
+                # from the epoch boundary instead of losing resume state entirely.
+                global_step = start_epoch * len(train_loader)
             msg = (f"Resuming basemodel training from {checkpoint_path}: starting at epoch "
-                   f"{start_epoch + 1}/{config.basemodel_epochs}, best_val_loss so far {best_val_loss:.4f}")
+                   f"{start_epoch + 1}/{config.basemodel_epochs}, global_step {global_step}, "
+                   f"best_val_loss so far {best_val_loss:.4f}")
             logger.info(msg)
             if rank == 0:
                 print(msg)
@@ -337,8 +343,25 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
-    batch_idx_global = start_epoch * len(train_loader)
+    batch_idx_global = global_step
     checkpoint_every_n_steps = getattr(config, 'checkpoint_every_n_steps', 0)
+
+    # A mid-epoch checkpoint (see checkpoint_every_n_steps below) records the
+    # *previous* completed epoch, so start_epoch here lands back on the
+    # interrupted epoch itself. Its dataloader always starts a fresh epoch at
+    # batch 0, but global_step already reflects the batches that epoch had
+    # finished before the interruption -- replaying them would both waste
+    # compute and desync the (already-restored) optimizer/scheduler state
+    # from the data position. Skip exactly that many batches once, on the
+    # first resumed epoch only.
+    skip_batches_in_resumed_epoch = max(0, batch_idx_global - start_epoch * len(train_loader))
+    if skip_batches_in_resumed_epoch > 0:
+        msg = (f"Mid-epoch resume: skipping the first {skip_batches_in_resumed_epoch}/"
+               f"{len(train_loader)} batches of epoch {start_epoch + 1} (already completed "
+               f"before the interruption)")
+        logger.info(msg)
+        if rank == 0:
+            print(msg)
 
     for epoch in range(start_epoch, config.basemodel_epochs):
         epoch_start_time = time.time()
@@ -349,10 +372,17 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
+        skip_batches = skip_batches_in_resumed_epoch if epoch == start_epoch else 0
+
         epoch_train_loss = 0.0
         train_batches = 0
 
         for batch_idx, (batch_x, batch_x_stamp) in enumerate(train_loader):
+            if batch_idx < skip_batches:
+                if batch_idx % checkpoint_every_n_steps == 0:
+                    print(f"Skipping batch {batch_idx} of epoch {epoch} (already completed before the interruption)")
+                continue
+
             batch_x = batch_x.to(device, non_blocking=True)
             batch_x_stamp = batch_x_stamp.to(device, non_blocking=True)
 
@@ -393,14 +423,21 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
                 # the interrupted epoch from its start rather than attempting exact
                 # mid-epoch resumption.
                 save_checkpoint(save_dir, model, optimizer, scheduler, epoch - 1, best_val_loss,
+                                 global_step=batch_idx_global,
                                  extra={'mid_epoch_step': batch_idx_global}, scaler=scaler)
 
         model.eval()
         val_loss = 0.0
         val_batches = 0
 
+        eval_start_msg = f"[Epoch {epoch+1}/{config.basemodel_epochs}] Starting evaluation on {len(val_loader)} validation batches..."
+        logger.info(eval_start_msg)
+        if rank == 0:
+            print(eval_start_msg)
+        eval_start_time = time.time()
+
         with torch.no_grad():
-            for batch_x, batch_x_stamp in val_loader:
+            for val_batch_idx, (batch_x, batch_x_stamp) in enumerate(val_loader):
                 batch_x = batch_x.to(device, non_blocking=True)
                 batch_x_stamp = batch_x_stamp.to(device, non_blocking=True)
 
@@ -414,6 +451,20 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
 
                 val_loss += loss.item()
                 val_batches += 1
+
+                if (val_batch_idx + 1) % config.checkpoint_every_n_steps == 0 or (val_batch_idx + 1) == len(val_loader):
+                    running_avg_val_loss = val_loss / val_batches
+                    eval_log_msg = (f"[Epoch {epoch+1}/{config.basemodel_epochs}, Eval Step {val_batch_idx+1}/{len(val_loader)}] "
+                                    f"Loss: {loss.item():.4f}, Running Avg Loss: {running_avg_val_loss:.4f}")
+                    logger.info(eval_log_msg)
+                    if rank == 0:
+                        print(eval_log_msg)
+
+        eval_time = time.time() - eval_start_time
+        eval_done_msg = f"[Epoch {epoch+1}/{config.basemodel_epochs}] Evaluation finished in {eval_time:.2f} seconds"
+        logger.info(eval_done_msg)
+        if rank == 0:
+            print(eval_done_msg)
 
         if use_ddp:
             tensor_sum = torch.tensor([epoch_train_loss, train_batches, val_loss, val_batches], dtype=torch.float64, device=device)
@@ -448,7 +499,8 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
                 print(save_msg)
 
         if rank == 0:
-            checkpoint_path = save_checkpoint(save_dir, model, optimizer, scheduler, epoch, best_val_loss, scaler=scaler)
+            checkpoint_path = save_checkpoint(save_dir, model, optimizer, scheduler, epoch, best_val_loss,
+                                               global_step=batch_idx_global, scaler=scaler)
             resume_msg = f"Checkpoint saved to: {checkpoint_path} (resume point: epoch {epoch + 1}/{config.basemodel_epochs})"
             logger.info(resume_msg)
             print(resume_msg)

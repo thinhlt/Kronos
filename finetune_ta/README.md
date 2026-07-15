@@ -38,6 +38,14 @@ python download_data.py       # bulk-downloads monthly kline archives from data.
 python clean_merge_data.py    # converts to Kronos format, merges months into one CSV per pair
 ```
 
+For **prediction input** (last calendar month through yesterday, monthly +
+daily archives, indicators included in one final file):
+
+```bash
+python download_input_predict_data.py --symbols BTCUSDT ADAUSDT
+# -> data/{SYMBOL}_kline_5min.csv
+```
+
 - `download_data.py` fetches Binance's public monthly ZIP archives (not the
   REST API -- far fewer requests for multi-year history) into
   `data/raw/{SYMBOL}/{SYMBOL}-5m-YYYY-MM.csv`. It only requests months that
@@ -211,6 +219,16 @@ trained against a specific tokenizer's token vocabulary.
 time and is generalized to any `feature_list`/`d_in`. It's kept separate
 from the shared `KronosPredictor` so `finetune_csv`/`finetune` inference is
 never affected by indicator-related changes.
+
+CLI (loads finetuned tokenizer + basemodel from the training config, writes
+results under `predictions/<data_file_stem>/`):
+
+```bash
+python predict.py --config configs/config_multi_symbol_5m_ta.yaml \
+  --input data/ADAUSDT_kline_5min.csv
+```
+
+Or programmatically:
 
 ```python
 import torch
