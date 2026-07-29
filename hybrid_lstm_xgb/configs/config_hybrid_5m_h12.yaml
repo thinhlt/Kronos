@@ -1,0 +1,64 @@
+# Hybrid LSTM + XGBoost baseline (see docs/research/hybrid-lstm-xgboost-baseline.md).
+# Default data_path points at the full multi-symbol 5m CSVs under finetune_ta/data/data/.
+
+data:
+  data_path: ./data/*_kline_5min.csv
+  lookback_window: 128
+  horizon: 12
+  train_stride: 12
+  backtest_stride: 1
+  clip: 5.0
+  train_ratio: 0.9
+  val_ratio: 0.1
+  test_ratio: 0.0
+  lstm_fraction: 0.75
+  purge_bars: 12
+
+features:
+  indicators:
+    heikin_ashi: true
+    kdj: true
+    macd: true
+    bollinger: true
+    atr: true
+    volume_sma: true
+  tabular:
+    last_bar_features: true
+    realized_vol: true
+    calendar: true
+
+lstm:
+  hidden_size: 64
+  num_layers: 1
+  dropout: 0.0
+  epochs: 50
+  batch_size: 512
+  learning_rate: 0.001
+  weight_decay: 0.01
+  dev_fraction: 0.1
+  early_stopping_patience: 8
+
+xgboost:
+  max_depth: 6
+  eta: 0.05
+  subsample: 0.8
+  colsample_bytree: 0.8
+  reg_lambda: 1.0
+  gamma: 0.0
+  n_estimators: 2000
+  early_stopping_rounds: 50
+  dev_fraction: 0.15
+
+experiment:
+  exp_name: hybrid_5m_h12
+  base_path: ./finetuned/
+  ablations:
+    lstm_only: true
+    xgb_only: true
+
+device:
+  use_cuda: true
+  device_id: 0
+
+seed: 42
+num_workers: 4

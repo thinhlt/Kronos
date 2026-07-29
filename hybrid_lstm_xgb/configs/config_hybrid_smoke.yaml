@@ -1,0 +1,64 @@
+# Smoke config: two short local CSVs so a full train+backtest finishes in minutes.
+data:
+  data_path:
+    - ../finetune_ta/data/BTCUSDT_kline_5min.csv
+    - ../finetune_ta/data/ETHUSDT_kline_5min.csv
+  lookback_window: 128
+  horizon: 12
+  train_stride: 12
+  backtest_stride: 1
+  clip: 5.0
+  train_ratio: 0.9
+  val_ratio: 0.1
+  test_ratio: 0.0
+  lstm_fraction: 0.75
+  purge_bars: 12
+
+features:
+  indicators:
+    heikin_ashi: true
+    kdj: true
+    macd: true
+    bollinger: true
+    atr: true
+    volume_sma: true
+  tabular:
+    last_bar_features: true
+    realized_vol: true
+    calendar: true
+
+lstm:
+  hidden_size: 64
+  num_layers: 1
+  dropout: 0.0
+  epochs: 5
+  batch_size: 64
+  learning_rate: 0.001
+  weight_decay: 0.01
+  dev_fraction: 0.1
+  early_stopping_patience: 3
+
+xgboost:
+  max_depth: 4
+  eta: 0.1
+  subsample: 0.8
+  colsample_bytree: 0.8
+  reg_lambda: 1.0
+  gamma: 0.0
+  n_estimators: 200
+  early_stopping_rounds: 20
+  dev_fraction: 0.15
+
+experiment:
+  exp_name: hybrid_smoke
+  base_path: ./finetuned/
+  ablations:
+    lstm_only: true
+    xgb_only: true
+
+device:
+  use_cuda: false
+  device_id: 0
+
+seed: 42
+num_workers: 0
