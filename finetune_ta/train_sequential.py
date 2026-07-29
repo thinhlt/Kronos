@@ -91,7 +91,7 @@ class SequentialTrainer:
         logger.info(f"Feature list ({self.config.d_in} dims): {self.config.feature_list}")
         logger.info(f"Lookback window: {self.config.lookback_window}")
         logger.info(f"Predict window: {self.config.predict_window}")
-        logger.info(f"Batch size: {self.config.batch_size}")
+        logger.info(f"Batch size: {self.config.tokenizer_batch_size}")
         logger.info(f"Learning rate: {self.config.tokenizer_learning_rate}")
         logger.info(f"Training epochs: {self.config.tokenizer_epochs}")
         logger.info(f"Device: {self.device}")
@@ -154,6 +154,10 @@ class SequentialTrainer:
                 print("pre_trained_predictor=False, randomly initializing Predictor architecture")
         model = build_predictor(self.config)
         model = model.to(self.device)
+        if self.rank == 0:
+            print("Compiling predictor with torch.compile...")
+        logger.info("Compiling predictor with torch.compile...")
+        model = torch.compile(model)
 
         model_size = sum(p.numel() for p in model.parameters())
         logger.info(f"Model parameters: {model_size:,}")
@@ -165,7 +169,7 @@ class SequentialTrainer:
         logger.info(f"Feature list ({self.config.d_in} dims): {self.config.feature_list}")
         logger.info(f"Lookback window: {self.config.lookback_window}")
         logger.info(f"Predict window: {self.config.predict_window}")
-        logger.info(f"Batch size: {self.config.batch_size}")
+        logger.info(f"Batch size: {self.config.basemodel_batch_size}")
         logger.info(f"Learning rate: {self.config.predictor_learning_rate}")
         logger.info(f"Training epochs: {self.config.basemodel_epochs}")
         logger.info(f"Device: {self.device}")

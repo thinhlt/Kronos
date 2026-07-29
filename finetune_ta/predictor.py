@@ -5,8 +5,8 @@ Deliberately isolated from model.kronos.KronosPredictor: that class is shared
 by finetune_csv/ and finetune/ and hardcodes the base 6-column feature set.
 KronosPredictorTA instead accepts a `feature_list`/`enabled_indicators` pair
 matching whatever the model was trained with, computes the same technical
-indicators at inference time via `indicators.py`, and otherwise mirrors
-KronosPredictor's normalize -> autoregress -> denormalize flow exactly.
+indicators at inference time via `indicators.py`, and uses the same
+open-anchor / z-score normalization as training (`feature_normalize.py`).
 """
 import sys
 
@@ -17,7 +17,8 @@ import torch
 sys.path.append('../')
 from model.kronos import auto_regressive_inference, calc_time_stamps
 
-from indicators import BASE_FEATURES, ensure_features
+from feature_normalize import denormalize_features, normalize_features
+from indicators import ensure_features
 
 
 class KronosPredictorTA:
@@ -87,9 +88,7 @@ class KronosPredictorTA:
         x_stamp = x_time_df.values.astype(np.float32)
         y_stamp = y_time_df.values.astype(np.float32)
 
-        x_mean, x_std = np.mean(x, axis=0), np.std(x, axis=0)
-        x = (x - x_mean) / (x_std + 1e-5)
-        x = np.clip(x, -self.clip, self.clip)
+        x, norm_state = normalize_features(x, self.feature_list, clip=self.clip)
 
         x = x[np.newaxis, :]
         x_stamp = x_stamp[np.newaxis, :]
@@ -98,7 +97,7 @@ class KronosPredictorTA:
         preds = self.generate(x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose)
 
         preds = preds.squeeze(0)
-        preds = preds * (x_std + 1e-5) + x_mean
+        preds = denormalize_features(preds, self.feature_list, norm_state)
 
         pred_df = pd.DataFrame(preds, columns=self.feature_list, index=y_timestamp)
         return pred_df

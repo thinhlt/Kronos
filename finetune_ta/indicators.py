@@ -15,6 +15,8 @@ BASE_FEATURES = ['open', 'high', 'low', 'close', 'volume', 'amount']
 KDJ_LENGTH, KDJ_SIGNAL = 9, 3
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 BOLLINGER_LENGTH, BOLLINGER_STD = 20, 2.0
+ATR_LENGTH = 14
+VOLUME_SMA_LENGTH = 50
 
 HEIKIN_ASHI_COLUMNS = ['HA_open', 'HA_high', 'HA_low', 'HA_close']
 KDJ_COLUMNS = [f'K_{KDJ_LENGTH}_{KDJ_SIGNAL}', f'D_{KDJ_LENGTH}_{KDJ_SIGNAL}', f'J_{KDJ_LENGTH}_{KDJ_SIGNAL}']
@@ -23,18 +25,24 @@ MACD_COLUMNS = [
     f'MACDh_{MACD_FAST}_{MACD_SLOW}_{MACD_SIGNAL}',
     f'MACDs_{MACD_FAST}_{MACD_SLOW}_{MACD_SIGNAL}',
 ]
-# Only the scale-free derivatives (%B, bandwidth) are kept -- the raw
-# upper/middle/lower bands are dropped since %B/bandwidth already normalize
-# the band's relationship to price.
-BOLLINGER_COLUMNS = [f'BBB_{BOLLINGER_LENGTH}_{BOLLINGER_STD}', f'BBP_{BOLLINGER_LENGTH}_{BOLLINGER_STD}']
+# Middle / upper / lower bands (price-scale).
+BOLLINGER_COLUMNS = [
+    f'BBM_{BOLLINGER_LENGTH}_{BOLLINGER_STD}',
+    f'BBU_{BOLLINGER_LENGTH}_{BOLLINGER_STD}',
+    f'BBL_{BOLLINGER_LENGTH}_{BOLLINGER_STD}',
+]
+ATR_COLUMNS = [f'ATRr_{ATR_LENGTH}']
+VOLUME_SMA_COLUMNS = [f'VOL_SMA_{VOLUME_SMA_LENGTH}']
 
 # Order matters: this defines the tokenizer's d_in layout.
-INDICATOR_ORDER = ['heikin_ashi', 'kdj', 'macd', 'bollinger']
+INDICATOR_ORDER = ['heikin_ashi', 'kdj', 'macd', 'bollinger', 'atr', 'volume_sma']
 INDICATOR_COLUMNS = {
     'heikin_ashi': HEIKIN_ASHI_COLUMNS,
     'kdj': KDJ_COLUMNS,
     'macd': MACD_COLUMNS,
     'bollinger': BOLLINGER_COLUMNS,
+    'atr': ATR_COLUMNS,
+    'volume_sma': VOLUME_SMA_COLUMNS,
 }
 
 DEFAULT_ENABLED_INDICATORS = {name: True for name in INDICATOR_ORDER}
@@ -53,8 +61,8 @@ def compute_indicators(df: pd.DataFrame, enabled_indicators: dict) -> pd.DataFra
     """Compute and append the enabled technical-indicator columns to `df`.
 
     `df` must already contain clean (non-NaN) `open, high, low, close` columns.
-    Indicators that need a warm-up period (MACD, Bollinger, KDJ) will produce
-    leading NaNs -- callers are expected to drop those rows before use.
+    Indicators that need a warm-up period (MACD, Bollinger, KDJ, ATR, volume SMA)
+    will produce leading NaNs -- callers are expected to drop those rows before use.
     """
     df = df.copy()
     required_ohlc = {'open', 'high', 'low', 'close'}
@@ -77,6 +85,15 @@ def compute_indicators(df: pd.DataFrame, enabled_indicators: dict) -> pd.DataFra
     if enabled_indicators.get('bollinger', False) and not set(BOLLINGER_COLUMNS).issubset(df.columns):
         bb = df.ta.bbands(length=BOLLINGER_LENGTH, std=BOLLINGER_STD)
         df[BOLLINGER_COLUMNS] = bb[BOLLINGER_COLUMNS]
+
+    if enabled_indicators.get('atr', False) and not set(ATR_COLUMNS).issubset(df.columns):
+        atr = df.ta.atr(length=ATR_LENGTH)
+        df[ATR_COLUMNS[0]] = atr
+
+    if enabled_indicators.get('volume_sma', False) and not set(VOLUME_SMA_COLUMNS).issubset(df.columns):
+        if 'volume' not in df.columns:
+            raise ValueError("Cannot compute volume SMA, missing column: volume")
+        df[VOLUME_SMA_COLUMNS[0]] = df['volume'].rolling(VOLUME_SMA_LENGTH).mean()
 
     return df
 

@@ -23,7 +23,7 @@ data:
   #   - "/content/drive/MyDrive/Kronos/data/ZECUSDT_kline_5min.csv"
   #   - "/content/drive/MyDrive/Kronos/data/AVAXUSDT_kline_5min.csv"
   lookback_window: 512
-  predict_window: 48
+  predict_window: 288
   max_context: 512
   clip: 5.0
   # split ratio is applied PER FILE (each symbol contributes its own last
@@ -38,25 +38,28 @@ features:
     kdj: true
     macd: true
     bollinger: true
+    atr: true
+    volume_sma: true
 
 training:
   tokenizer_epochs: 3
   basemodel_epochs: 3
-  # Kaggle GPUs (T4 x1/x2, P100) have less memory than typical workstation
-  # GPUs -- drop this further if you hit OOM.
-  batch_size: 32
+  # Tokenizer is lighter on memory -- use a larger batch. Basemodel (AR
+  # predictor) is heavier; keep it smaller to avoid OOM.
+  tokenizer_batch_size: 256
+  basemodel_batch_size: 32
   log_interval: 50
   # Kaggle notebooks have 4 CPU cores; more workers than that just contend.
   num_workers: 2
   seed: 42
 
   tokenizer_learning_rate: 0.0002
-  predictor_learning_rate: 0.000001
+  predictor_learning_rate: 0.00002
 
   adam_beta1: 0.9
   adam_beta2: 0.95
   adam_weight_decay: 0.1
-  accumulation_steps: 2
+  accumulation_steps: 4
 
   # Kaggle sessions are capped (~9-12h interactive, 30 GPU-hrs/week quota) and
   # /kaggle/working is wiped on a fresh session -- resume=true makes it safe

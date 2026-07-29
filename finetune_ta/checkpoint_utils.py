@@ -19,10 +19,43 @@ CHECKPOINT_FILENAME = "checkpoint_last.pt"
 
 
 def _unwrap(model):
-    """DDP-wrapped models nest the real module under `.module`; checkpoints
-    always store/restore the underlying module's state so they load fine
-    whether or not the run that resumes them uses distributed training."""
-    return model.module if hasattr(model, "module") else model
+    """Peel DDP / DataParallel / torch.compile wrappers down to the real
+    module. Checkpoints always store/restore that underlying state_dict so
+    they load fine whether the run that saved or resumes them used DDP,
+    torch.compile, both, or neither.
+
+    torch.compile nests the original module under `_orig_mod`; saving the
+    wrapper's state_dict otherwise prefixes every key with `_orig_mod.` and
+    breaks load into a plain KronosTokenizer / predictor.
+    """
+    while True:
+        if isinstance(model, (torch.nn.parallel.DistributedDataParallel,
+                              torch.nn.DataParallel)):
+            model = model.module
+        elif hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+        else:
+            break
+    return model
+
+
+def _normalize_state_dict(state_dict):
+    """Strip `module.` / `_orig_mod.` key prefixes left by older checkpoints
+    that were saved without unwrapping DDP or torch.compile wrappers."""
+    prefixes = ("module.", "_orig_mod.")
+    normalized = {}
+    for key, value in state_dict.items():
+        while True:
+            stripped = False
+            for prefix in prefixes:
+                if key.startswith(prefix):
+                    key = key[len(prefix):]
+                    stripped = True
+                    break
+            if not stripped:
+                break
+        normalized[key] = value
+    return normalized
 
 
 def find_checkpoint(save_dir: str):
@@ -73,6 +106,39 @@ def save_checkpoint(save_dir, model, optimizer, scheduler, epoch, best_val_loss,
     torch.save(state, tmp_path)
     shutil.copyfile(tmp_path, checkpoint_path)
 
+    # #region agent log
+    try:
+        import json, time as _time
+        _payload = {
+            "sessionId": "1a47a0",
+            "runId": "pre-fix",
+            "hypothesisId": "H3_H5",
+            "location": "checkpoint_utils.py:save_checkpoint",
+            "message": "checkpoint saved",
+            "data": {
+                "checkpoint_path": checkpoint_path,
+                "epoch": epoch,
+                "global_step": global_step,
+                "extra": extra,
+                "tmp_path": tmp_path,
+            },
+            "timestamp": int(_time.time() * 1000),
+        }
+        for _p in (
+            "/Users/macintosh/Prj/Kronos/.cursor/debug-1a47a0.log",
+            os.path.join(save_dir, "debug-1a47a0.log"),
+        ):
+            try:
+                os.makedirs(os.path.dirname(_p), exist_ok=True)
+                with open(_p, "a", encoding="utf-8") as _f:
+                    _f.write(json.dumps(_payload) + "\n")
+            except Exception:
+                pass
+        print(f"[DEBUG_RESUME] {json.dumps(_payload)}")
+    except Exception:
+        pass
+    # #endregion
+
     return checkpoint_path
 
 
@@ -85,7 +151,7 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler, device=None, s
     callers should fall back to an epoch-based approximation in that case."""
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-    _unwrap(model).load_state_dict(checkpoint["model_state_dict"])
+    _unwrap(model).load_state_dict(_normalize_state_dict(checkpoint["model_state_dict"]))
 
     if optimizer is not None and checkpoint.get("optimizer_state_dict") is not None:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -113,5 +179,42 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler, device=None, s
     best_val_loss = checkpoint.get("best_val_loss", float("inf"))
     start_epoch = saved_epoch + 1
     global_step = checkpoint.get("global_step")
+
+    # #region agent log
+    try:
+        import json, time as _time
+        _extra = checkpoint.get("extra")
+        _payload = {
+            "sessionId": "1a47a0",
+            "runId": "pre-fix",
+            "hypothesisId": "H2_H3_H5",
+            "location": "checkpoint_utils.py:load_checkpoint",
+            "message": "checkpoint fields after load",
+            "data": {
+                "checkpoint_path": str(checkpoint_path),
+                "saved_epoch": saved_epoch,
+                "start_epoch": start_epoch,
+                "global_step": global_step,
+                "has_extra": _extra is not None,
+                "extra_keys": list(_extra.keys()) if isinstance(_extra, dict) else None,
+                "extra": {k: _extra.get(k) for k in ("mid_epoch_step", "epoch_batch_idx", "steps_per_epoch") if isinstance(_extra, dict)},
+                "ckpt_keys": sorted(list(checkpoint.keys())),
+            },
+            "timestamp": int(_time.time() * 1000),
+        }
+        for _p in (
+            "/Users/macintosh/Prj/Kronos/.cursor/debug-1a47a0.log",
+            os.path.join(os.path.dirname(checkpoint_path), "debug-1a47a0.log"),
+        ):
+            try:
+                os.makedirs(os.path.dirname(_p), exist_ok=True)
+                with open(_p, "a", encoding="utf-8") as _f:
+                    _f.write(json.dumps(_payload) + "\n")
+            except Exception:
+                pass
+        print(f"[DEBUG_RESUME] {json.dumps(_payload)}")
+    except Exception:
+        pass
+    # #endregion
 
     return start_epoch, best_val_loss, global_step

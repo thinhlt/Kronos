@@ -1,11 +1,9 @@
 import os
 import sys
+import time
 import random
-import pandas as pd
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
-from torch.utils.data.distributed import DistributedSampler
 import logging
 from logging.handlers import RotatingFileHandler
 import datetime
@@ -13,167 +11,39 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 sys.path.append('../')
-from indicators import BASE_FEATURES, ensure_features
 from model_factory import load_finetuned_tokenizer
 from checkpoint_utils import find_checkpoint, load_checkpoint, save_checkpoint
+from dataloaders import create_dataloaders
+from feature_normalize import normalize_features_torch
+from logic_loss import (
+    build_bit_tables,
+    freeze_tokenizer,
+    logic_loss_from_logits,
+)
 
 
-class CustomKlineDataset(Dataset):
-    """Loads one or more OHLCV(+indicator) CSVs as a single dataset.
+def _make_optimizer(model, config):
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr=config.predictor_learning_rate,
+        betas=(config.adam_beta1, config.adam_beta2),
+        weight_decay=config.adam_weight_decay,
+    )
 
-    Each file is loaded, indicator-augmented, and time-split independently --
-    a training window is never built from more than one file, so a sample is
-    never partly one symbol and partly another. See
-    docs/adr/0002-multi-file-windows-never-cross-files.md.
-    """
 
-    def __init__(self, data_paths, data_type='train', lookback_window=90, predict_window=10,
-                 clip=5.0, seed=100, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15,
-                 feature_list=None, enabled_indicators=None):
-        self.data_paths = [data_paths] if isinstance(data_paths, str) else list(data_paths)
-        if not self.data_paths:
-            raise ValueError("CustomKlineDataset requires at least one data path")
-        self.data_type = data_type
-        self.lookback_window = lookback_window
-        self.predict_window = predict_window
-        self.window = lookback_window + predict_window + 1
-        self.clip = clip
-        self.seed = seed
-        self.train_ratio = train_ratio
-        self.val_ratio = val_ratio
-        self.test_ratio = test_ratio
+def _make_scheduler(optimizer, config, steps_per_epoch, epochs):
+    return torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=config.predictor_learning_rate,
+        steps_per_epoch=steps_per_epoch,
+        epochs=epochs,
+        pct_start=0.1,
+        div_factor=10,
+    )
 
-        self.feature_list = list(feature_list) if feature_list else list(BASE_FEATURES)
-        self.enabled_indicators = enabled_indicators or {}
-        self.time_feature_list = ['minute', 'hour', 'weekday', 'day', 'month']
 
-        self.py_rng = random.Random(seed)
-
-        # Per-file post-split data/timestamps and each file's own (non-overlapping)
-        # window count -- the global sample index below is just the concatenation
-        # of these per-file counts.
-        self.file_data = []
-        self.file_timestamps = []
-        self.file_n_samples = []
-        for data_path in self.data_paths:
-            data, timestamps = self._load_and_preprocess_one(data_path)
-            data, timestamps = self._split_one_by_time(data, timestamps)
-            n_samples = max(0, len(data) - self.window + 1)
-            self.file_data.append(data)
-            self.file_timestamps.append(timestamps)
-            self.file_n_samples.append(n_samples)
-
-        self.cumulative_samples = np.cumsum([0] + self.file_n_samples)
-        self.n_samples = int(self.cumulative_samples[-1])
-
-        total_length = sum(len(d) for d in self.file_data)
-        print(f"[{data_type.upper()}] {len(self.data_paths)} file(s), total data length: "
-              f"{total_length}, available samples: {self.n_samples}")
-        if self.n_samples == 0:
-            raise ValueError(
-                f"[{data_type.upper()}] No usable samples across {len(self.data_paths)} file(s) -- "
-                f"lookback_window+predict_window ({self.window}) may be larger than the "
-                f"{data_type} split of at least one file."
-            )
-
-    def _load_and_preprocess_one(self, data_path):
-        df = pd.read_csv(data_path)
-
-        df['timestamps'] = pd.to_datetime(df['timestamps'])
-        df = df.sort_values('timestamps').reset_index(drop=True)
-
-        # Forward-fill stray gaps in the base OHLCV+amount columns before deriving
-        # indicators from them, so a single missing tick doesn't NaN-out an entire
-        # indicator warm-up window downstream.
-        if df[BASE_FEATURES].isnull().any().any():
-            print(f"Warning: Missing values found in base OHLCV data ({data_path}), performing forward fill")
-            df[BASE_FEATURES] = df[BASE_FEATURES].fillna(method='ffill')
-
-        df = ensure_features(df, self.feature_list, self.enabled_indicators)
-
-        df['minute'] = df['timestamps'].dt.minute
-        df['hour'] = df['timestamps'].dt.hour
-        df['weekday'] = df['timestamps'].dt.weekday
-        df['day'] = df['timestamps'].dt.day
-        df['month'] = df['timestamps'].dt.month
-
-        data = df[self.feature_list + self.time_feature_list].copy()
-        timestamps = df['timestamps'].copy()
-
-        # Indicators like MACD/Bollinger/KDJ need a warm-up period and produce
-        # leading NaNs; drop those rows rather than fabricate warm-up values.
-        before = len(data)
-        valid_mask = data[self.feature_list].notna().all(axis=1)
-        data = data.loc[valid_mask].reset_index(drop=True)
-        timestamps = timestamps.loc[valid_mask].reset_index(drop=True)
-        dropped = before - len(data)
-        if dropped > 0:
-            print(f"Dropped {dropped} leading rows with NaN technical-indicator warm-up values ({data_path})")
-
-        print(f"[{os.path.basename(data_path)}] time range: {timestamps.min()} to {timestamps.max()}, "
-              f"usable length: {len(data)} records")
-
-        return data, timestamps
-
-    def _split_one_by_time(self, data, timestamps):
-        total_length = len(data)
-
-        train_end = int(total_length * self.train_ratio)
-        val_end = int(total_length * (self.train_ratio + self.val_ratio))
-
-        if self.data_type == 'train':
-            data = data.iloc[:train_end]
-            timestamps = timestamps.iloc[:train_end]
-        elif self.data_type == 'val':
-            data = data.iloc[train_end:val_end]
-            timestamps = timestamps.iloc[train_end:val_end]
-        elif self.data_type == 'test':
-            data = data.iloc[val_end:]
-            timestamps = timestamps.iloc[val_end:]
-
-        return data.reset_index(drop=True), timestamps.reset_index(drop=True)
-
-    def set_epoch_seed(self, epoch):
-        epoch_seed = self.seed + epoch
-        self.py_rng.seed(epoch_seed)
-        self.current_epoch = epoch
-
-    def __len__(self):
-        return self.n_samples
-
-    def _locate(self, idx):
-        file_idx = int(np.searchsorted(self.cumulative_samples, idx, side='right') - 1)
-        local_idx = idx - int(self.cumulative_samples[file_idx])
-        return file_idx, local_idx
-
-    def __getitem__(self, idx):
-        file_idx, local_idx = self._locate(idx)
-        data = self.file_data[file_idx]
-        max_start = len(data) - self.window
-        if max_start <= 0:
-            raise ValueError(f"Data length insufficient to create samples in file: {self.data_paths[file_idx]}")
-
-        if self.data_type == 'train':
-            epoch = getattr(self, 'current_epoch', 0)
-            start_idx = (local_idx * 9973 + (epoch + 1) * 104729) % (max_start + 1)
-        else:
-            start_idx = local_idx % (max_start + 1)
-
-        end_idx = start_idx + self.window
-
-        window_data = data.iloc[start_idx:end_idx]
-
-        x = window_data[self.feature_list].values.astype(np.float32)
-        x_stamp = window_data[self.time_feature_list].values.astype(np.float32)
-
-        x_mean, x_std = np.mean(x, axis=0), np.std(x, axis=0)
-        x = (x - x_mean) / (x_std + 1e-5)
-        x = np.clip(x, -self.clip, self.clip)
-
-        x_tensor = torch.from_numpy(x)
-        x_stamp_tensor = torch.from_numpy(x_stamp)
-
-        return x_tensor, x_stamp_tensor
+def _make_grad_scaler(use_amp, amp_dtype):
+    return torch.cuda.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
 
 
 def setup_logging(exp_name: str, log_dir: str, rank: int = 0) -> logging.Logger:
@@ -220,99 +90,58 @@ def setup_logging(exp_name: str, log_dir: str, rank: int = 0) -> logging.Logger:
     return logger
 
 
-def create_dataloaders(config):
-    if not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0:
-        print("Creating data loaders...")
-
-    train_dataset = CustomKlineDataset(
-        data_paths=config.data_paths,
-        data_type='train',
-        lookback_window=config.lookback_window,
-        predict_window=config.predict_window,
-        clip=config.clip,
-        seed=config.seed,
-        train_ratio=config.train_ratio,
-        val_ratio=config.val_ratio,
-        test_ratio=config.test_ratio,
-        feature_list=config.feature_list,
-        enabled_indicators=config.enabled_indicators
-    )
-
-    val_dataset = CustomKlineDataset(
-        data_paths=config.data_paths,
-        data_type='val',
-        lookback_window=config.lookback_window,
-        predict_window=config.predict_window,
-        clip=config.clip,
-        seed=config.seed + 1,
-        train_ratio=config.train_ratio,
-        val_ratio=config.val_ratio,
-        test_ratio=config.test_ratio,
-        feature_list=config.feature_list,
-        enabled_indicators=config.enabled_indicators
-    )
-
-    use_ddp = dist.is_available() and dist.is_initialized()
-    train_sampler = DistributedSampler(train_dataset, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=True) if use_ddp else None
-    val_sampler = DistributedSampler(val_dataset, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=False, drop_last=False) if use_ddp else None
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=(train_sampler is None),
-        num_workers=config.num_workers,
-        pin_memory=True,
-        drop_last=True,
-        sampler=train_sampler
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=True,
-        drop_last=False,
-        sampler=val_sampler
-    )
-
-    if not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0:
-        print(f"Training set size: {len(train_dataset)}, Validation set size: {len(val_dataset)}")
-
-    return train_loader, val_loader, train_dataset, val_dataset, train_sampler, val_sampler
-
-
 def train_model(model, tokenizer, device, config, save_dir, logger):
     logger.info("Starting training...")
     use_ddp = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if use_ddp else 0
-    world_size = dist.get_world_size() if use_ddp else 1
 
-    train_loader, val_loader, train_dataset, val_dataset, train_sampler, val_sampler = create_dataloaders(config)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.predictor_learning_rate,
-        betas=(config.adam_beta1, config.adam_beta2),
-        weight_decay=config.adam_weight_decay
+    train_loader, val_loader, train_dataset, val_dataset, train_sampler, val_sampler = create_dataloaders(
+        config, batch_size=config.basemodel_batch_size
     )
 
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=config.predictor_learning_rate,
-        steps_per_epoch=len(train_loader),
-        epochs=config.basemodel_epochs,
-        pct_start=0.03,
-        div_factor=10
-    )
+    # Tokenizer stays frozen; soft-decode still propagates grads into logits.
+    freeze_tokenizer(tokenizer)
+
+    logic_enabled = bool(getattr(config, 'logic_loss_enabled', False))
+    logic_weight = float(getattr(config, 'logic_loss_weight', 0.1))
+    logic_ohlc_weight = float(getattr(config, 'logic_loss_ohlc_weight', 1.0))
+    logic_ha_weight = float(getattr(config, 'logic_loss_ha_weight', 1.0))
+    logic_max_timesteps = int(getattr(config, 'logic_loss_max_timesteps', 128))
+    logic_use_checkpoint = bool(getattr(config, 'logic_loss_use_checkpoint', True))
+
+    s1_bit_table = s2_bit_table = None
+    if logic_enabled:
+        tok = tokenizer.module if hasattr(tokenizer, 'module') else tokenizer
+        s1_bit_table, s2_bit_table = build_bit_tables(
+            tok.s1_bits, tok.s2_bits, tok.codebook_dim, device=device
+        )
+        msg = (
+            f"Logic loss configured: enabled={logic_enabled}, "
+            f"weight={logic_weight}, ohlc_weight={logic_ohlc_weight}, ha_weight={logic_ha_weight}, "
+            f"max_timesteps={logic_max_timesteps}, use_checkpoint={logic_use_checkpoint}"
+        )
+        logger.info(msg)
+        if rank == 0:
+            print(msg)
+
+    accumulation_steps = max(1, int(getattr(config, 'accumulation_steps', 1)))
+    # OneCycle steps once per optimizer update (after accumulation), not per micro-batch.
+    steps_per_epoch = max(1, len(train_loader) // accumulation_steps)
+    optimizer = _make_optimizer(model, config)
+    scheduler = _make_scheduler(optimizer, config, steps_per_epoch, config.basemodel_epochs)
 
     # Mixed precision: only meaningful on CUDA. fp16 needs a GradScaler to
     # avoid gradient underflow; bf16 has fp32's exponent range so the scaler
     # is created disabled (a no-op) in that case.
     use_amp = bool(getattr(config, 'use_amp', False)) and device.type == 'cuda'
     amp_dtype = torch.bfloat16 if getattr(config, 'amp_dtype', 'fp16') == 'bf16' else torch.float16
-    scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
+    scaler = _make_grad_scaler(use_amp, amp_dtype)
     if rank == 0:
         print(f"Mixed precision (AMP): {use_amp} (dtype: {amp_dtype if use_amp else 'n/a'})")
+        print(
+            f"Basemodel batch={config.basemodel_batch_size}, accumulation={accumulation_steps}, "
+            f"effective_batch≈{config.basemodel_batch_size * accumulation_steps}"
+        )
 
     start_epoch = 0
     best_val_loss = float('inf')
@@ -320,20 +149,27 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
     if getattr(config, 'resume', True):
         checkpoint_path = find_checkpoint(save_dir)
         if checkpoint_path:
-            start_epoch, best_val_loss, global_step = load_checkpoint(checkpoint_path, model, optimizer, scheduler, device=device, scaler=scaler)
+            start_epoch, best_val_loss, global_step = load_checkpoint(
+                checkpoint_path, model, optimizer, scheduler, device=device, scaler=scaler
+            )
             if global_step is None:
                 # Older checkpoint predating global_step tracking -- approximate
                 # from the epoch boundary instead of losing resume state entirely.
                 global_step = start_epoch * len(train_loader)
-            msg = (f"Resuming basemodel training from {checkpoint_path}: starting at epoch "
-                   f"{start_epoch + 1}/{config.basemodel_epochs}, global_step {global_step}, "
-                   f"best_val_loss so far {best_val_loss:.4f}")
+            msg = (
+                f"Resuming basemodel training from {checkpoint_path}: starting at epoch "
+                f"{start_epoch + 1}/{config.basemodel_epochs}, global_step {global_step}, "
+                f"best_val_loss so far {best_val_loss:.4f}"
+            )
             logger.info(msg)
             if rank == 0:
                 print(msg)
 
     if start_epoch >= config.basemodel_epochs:
-        msg = f"Checkpoint already completed all {config.basemodel_epochs} configured epochs, nothing to resume"
+        msg = (
+            f"Checkpoint already completed all {config.basemodel_epochs} "
+            f"configured epochs, nothing to resume"
+        )
         logger.info(msg)
         if rank == 0:
             print(msg)
@@ -354,11 +190,56 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
     # compute and desync the (already-restored) optimizer/scheduler state
     # from the data position. Skip exactly that many batches once, on the
     # first resumed epoch only.
-    skip_batches_in_resumed_epoch = max(0, batch_idx_global - start_epoch * len(train_loader))
+    _epoch_boundary_steps = start_epoch * len(train_loader)
+    skip_batches_in_resumed_epoch = max(0, batch_idx_global % len(train_loader))
+    # #region agent log
+    try:
+        import json, time as _time
+        _payload = {
+            "sessionId": "1a47a0",
+            "runId": "pre-fix",
+            "hypothesisId": "H1_H4_H5",
+            "location": "finetune_base_model.py:skip_batches",
+            "message": "resume skip-batch computation",
+            "data": {
+                "save_dir": str(save_dir),
+                "start_epoch": start_epoch,
+                "start_epoch_1indexed": start_epoch + 1,
+                "global_step": batch_idx_global,
+                "len_train_loader": len(train_loader),
+                "epoch_boundary_steps": _epoch_boundary_steps,
+                "raw_skip": batch_idx_global - _epoch_boundary_steps,
+                "skip_batches_in_resumed_epoch": skip_batches_in_resumed_epoch,
+                "basemodel_batch_size": getattr(config, "basemodel_batch_size", None),
+                "accumulation_steps": accumulation_steps,
+                "implied_steps_per_epoch_from_global": (
+                    (batch_idx_global / start_epoch) if start_epoch > 0 else None
+                ),
+            },
+            "timestamp": int(_time.time() * 1000),
+        }
+        for _p in (
+            "/Users/macintosh/Prj/Kronos/.cursor/debug-1a47a0.log",
+            os.path.join(save_dir, "debug-1a47a0.log"),
+        ):
+            try:
+                os.makedirs(os.path.dirname(_p), exist_ok=True)
+                with open(_p, "a", encoding="utf-8") as _f:
+                    _f.write(json.dumps(_payload) + "\n")
+            except Exception:
+                pass
+        logger.info(f"[DEBUG_RESUME] {json.dumps(_payload)}")
+        if rank == 0:
+            print(f"[DEBUG_RESUME] {json.dumps(_payload)}")
+    except Exception:
+        pass
+    # #endregion
     if skip_batches_in_resumed_epoch > 0:
-        msg = (f"Mid-epoch resume: skipping the first {skip_batches_in_resumed_epoch}/"
-               f"{len(train_loader)} batches of epoch {start_epoch + 1} (already completed "
-               f"before the interruption)")
+        msg = (
+            f"Mid-epoch resume: skipping the first {skip_batches_in_resumed_epoch}/"
+            f"{len(train_loader)} batches of epoch {start_epoch + 1} (already completed "
+            f"before the interruption)"
+        )
         logger.info(msg)
         if rank == 0:
             print(msg)
@@ -373,18 +254,26 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
             train_sampler.set_epoch(epoch)
 
         skip_batches = skip_batches_in_resumed_epoch if epoch == start_epoch else 0
+        raw_model = model.module if use_ddp else model
 
         epoch_train_loss = 0.0
         train_batches = 0
+        optimizer.zero_grad(set_to_none=True)
 
         for batch_idx, (batch_x, batch_x_stamp) in enumerate(train_loader):
             if batch_idx < skip_batches:
-                if batch_idx % checkpoint_every_n_steps == 0:
-                    print(f"Skipping batch {batch_idx} of epoch {epoch} (already completed before the interruption)")
+                if checkpoint_every_n_steps > 0 and batch_idx % checkpoint_every_n_steps == 0:
+                    print(
+                        f"Skipping batch {batch_idx} of epoch {epoch} "
+                        f"(already completed before the interruption)"
+                    )
                 continue
 
             batch_x = batch_x.to(device, non_blocking=True)
             batch_x_stamp = batch_x_stamp.to(device, non_blocking=True)
+            batch_x = normalize_features_torch(
+                batch_x, config.feature_list, clip=config.clip
+            )
 
             with torch.no_grad():
                 token_seq_0, token_seq_1 = tokenizer.encode(batch_x, half=True)
@@ -392,25 +281,52 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
             token_in = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
             token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
 
+            logic_loss_val = None
+            is_accum_boundary = ((train_batches + 1) % accumulation_steps == 0) or (batch_idx + 1 == len(train_loader))
+
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                logits = (model.module if use_ddp else model)(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
-                loss, s1_loss, s2_loss = (model.module if use_ddp else model).head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
+                logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
+                ce_loss, s1_loss, s2_loss = raw_model.head.compute_loss(
+                    logits[0], logits[1], token_out[0], token_out[1]
+                )
+                loss = ce_loss
+                if logic_enabled:
+                    logic_loss_val = logic_loss_from_logits(
+                        tokenizer,
+                        logits[0],
+                        logits[1],
+                        s1_bit_table,
+                        s2_bit_table,
+                        config.feature_list,
+                        ohlc_weight=logic_ohlc_weight,
+                        ha_weight=logic_ha_weight,
+                        max_timesteps=logic_max_timesteps,
+                        use_checkpoint=logic_use_checkpoint,
+                    )
+                    loss = ce_loss + logic_weight * logic_loss_val
+            scaler.scale(loss / accumulation_steps).backward()
 
-            optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_((model.module if use_ddp else model).parameters(), max_norm=3.0)
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
+            if is_accum_boundary:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_norm=3.0)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
 
-            epoch_train_loss += loss.item()
+            epoch_train_loss += float(loss.item() if torch.is_tensor(loss) else loss)
             train_batches += 1
 
             if (batch_idx_global + 1) % config.log_interval == 0:
                 lr = optimizer.param_groups[0]['lr']
-                log_msg = (f"[Epoch {epoch+1}/{config.basemodel_epochs}, Step {batch_idx+1}/{len(train_loader)}] "
-                          f"LR: {lr:.6f}, Loss: {loss.item():.4f}")
+                loss_item = float(loss.item() if torch.is_tensor(loss) else loss)
+                log_msg = (
+                    f"[Epoch {epoch+1}/{config.basemodel_epochs}, "
+                    f"Step {batch_idx+1}/{len(train_loader)}] "
+                    f"LR: {lr:.6f}, Loss: {loss_item:.4f}"
+                )
+                if logic_loss_val is not None:
+                    log_msg += f", CE: {ce_loss.item():.4f}, Logic: {logic_loss_val.item():.4f}"
                 logger.info(log_msg)
                 if rank == 0:
                     print(log_msg)
@@ -418,19 +334,33 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
             batch_idx_global += 1
 
             if checkpoint_every_n_steps > 0 and rank == 0 and batch_idx_global % checkpoint_every_n_steps == 0:
+                loss_item = float(loss.item() if torch.is_tensor(loss) else loss)
+                lr = optimizer.param_groups[0]['lr']
+                if hasattr(logger, 'log_metric'):
+                    logger.log_metric('train_predictor_loss_batch', loss_item, step=batch_idx_global)
+                    logger.log_metric('train_S1_loss_each_batch', s1_loss.detach(), step=batch_idx_global)
+                    logger.log_metric('train_S2_loss_each_batch', s2_loss.detach(), step=batch_idx_global)
+                    logger.log_metric('predictor_learning_rate', lr, step=batch_idx_global)
+                    if logic_loss_val is not None:
+                        logger.log_metric('train_logic_loss_batch', logic_loss_val.item(), step=batch_idx_global)
                 # Mid-epoch safety net: record the *previous* completed epoch as the
                 # resume point (not the in-progress one), so resuming just re-runs
                 # the interrupted epoch from its start rather than attempting exact
                 # mid-epoch resumption.
-                save_checkpoint(save_dir, model, optimizer, scheduler, epoch - 1, best_val_loss,
-                                 global_step=batch_idx_global,
-                                 extra={'mid_epoch_step': batch_idx_global}, scaler=scaler)
+                save_checkpoint(
+                    save_dir, model, optimizer, scheduler, epoch - 1, best_val_loss,
+                    global_step=batch_idx_global,
+                    extra={'mid_epoch_step': batch_idx_global}, scaler=scaler,
+                )
 
         model.eval()
         val_loss = 0.0
         val_batches = 0
 
-        eval_start_msg = f"[Epoch {epoch+1}/{config.basemodel_epochs}] Starting evaluation on {len(val_loader)} validation batches..."
+        eval_start_msg = (
+            f"[Epoch {epoch+1}/{config.basemodel_epochs}] Starting evaluation on "
+            f"{len(val_loader)} validation batches..."
+        )
         logger.info(eval_start_msg)
         if rank == 0:
             print(eval_start_msg)
@@ -440,34 +370,62 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
             for val_batch_idx, (batch_x, batch_x_stamp) in enumerate(val_loader):
                 batch_x = batch_x.to(device, non_blocking=True)
                 batch_x_stamp = batch_x_stamp.to(device, non_blocking=True)
+                batch_x = normalize_features_torch(
+                    batch_x, config.feature_list, clip=config.clip
+                )
 
                 token_seq_0, token_seq_1 = tokenizer.encode(batch_x, half=True)
                 token_in = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
                 token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
 
                 with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                    logits = (model.module if use_ddp else model)(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
-                    loss, _, _ = (model.module if use_ddp else model).head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
+                    logits = raw_model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
+                    loss, _, _ = raw_model.head.compute_loss(
+                        logits[0], logits[1], token_out[0], token_out[1]
+                    )
 
                 val_loss += loss.item()
                 val_batches += 1
 
-                if (val_batch_idx + 1) % config.checkpoint_every_n_steps == 0 or (val_batch_idx + 1) == len(val_loader):
+                if checkpoint_every_n_steps > 0 and (
+                    (val_batch_idx + 1) % checkpoint_every_n_steps == 0
+                    or (val_batch_idx + 1) == len(val_loader)
+                ):
                     running_avg_val_loss = val_loss / val_batches
-                    eval_log_msg = (f"[Epoch {epoch+1}/{config.basemodel_epochs}, Eval Step {val_batch_idx+1}/{len(val_loader)}] "
-                                    f"Loss: {loss.item():.4f}, Running Avg Loss: {running_avg_val_loss:.4f}")
+                    eval_log_msg = (
+                        f"[Epoch {epoch+1}/{config.basemodel_epochs}, "
+                        f"Eval Step {val_batch_idx+1}/{len(val_loader)}] "
+                        f"Loss: {loss.item():.4f}, Running Avg Loss: {running_avg_val_loss:.4f}"
+                    )
+                    logger.info(eval_log_msg)
+                    if rank == 0:
+                        print(eval_log_msg)
+                elif checkpoint_every_n_steps <= 0 and (val_batch_idx + 1) == len(val_loader):
+                    running_avg_val_loss = val_loss / val_batches
+                    eval_log_msg = (
+                        f"[Epoch {epoch+1}/{config.basemodel_epochs}, "
+                        f"Eval Step {val_batch_idx+1}/{len(val_loader)}] "
+                        f"Loss: {loss.item():.4f}, Running Avg Loss: {running_avg_val_loss:.4f}"
+                    )
                     logger.info(eval_log_msg)
                     if rank == 0:
                         print(eval_log_msg)
 
         eval_time = time.time() - eval_start_time
-        eval_done_msg = f"[Epoch {epoch+1}/{config.basemodel_epochs}] Evaluation finished in {eval_time:.2f} seconds"
+        eval_done_msg = (
+            f"[Epoch {epoch+1}/{config.basemodel_epochs}] "
+            f"Evaluation finished in {eval_time:.2f} seconds"
+        )
         logger.info(eval_done_msg)
         if rank == 0:
             print(eval_done_msg)
 
         if use_ddp:
-            tensor_sum = torch.tensor([epoch_train_loss, train_batches, val_loss, val_batches], dtype=torch.float64, device=device)
+            tensor_sum = torch.tensor(
+                [epoch_train_loss, train_batches, val_loss, val_batches],
+                dtype=torch.float64,
+                device=device,
+            )
             dist.all_reduce(tensor_sum, op=dist.ReduceOp.SUM)
             epoch_train_loss_all = tensor_sum[0].item()
             train_batches_all = int(tensor_sum[1].item())
@@ -480,10 +438,12 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
             avg_val_loss = val_loss / val_batches if val_batches > 0 else 0
 
         epoch_time = time.time() - epoch_start_time
-        epoch_summary = (f"\n--- Epoch {epoch+1}/{config.basemodel_epochs} Summary ---\n"
-                       f"Training Loss: {avg_train_loss:.4f}\n"
-                       f"Validation Loss: {avg_val_loss:.4f}\n"
-                       f"Epoch Time: {epoch_time:.2f} seconds\n")
+        epoch_summary = (
+            f"\n--- Epoch {epoch+1}/{config.basemodel_epochs} Summary ---\n"
+            f"Training Loss: {avg_train_loss:.4f}\n"
+            f"Validation Loss: {avg_val_loss:.4f}\n"
+            f"Epoch Time: {epoch_time:.2f} seconds\n"
+        )
         logger.info(epoch_summary)
         if rank == 0:
             print(epoch_summary)
@@ -494,14 +454,22 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
                 model_save_path = os.path.join(save_dir, "best_model")
                 os.makedirs(model_save_path, exist_ok=True)
                 (model.module if use_ddp else model).save_pretrained(model_save_path)
-                save_msg = f"Best model saved to: {model_save_path} (validation loss: {best_val_loss:.4f})"
+                save_msg = (
+                    f"Best model saved to: {model_save_path} "
+                    f"(validation loss: {best_val_loss:.4f})"
+                )
                 logger.info(save_msg)
                 print(save_msg)
 
         if rank == 0:
-            checkpoint_path = save_checkpoint(save_dir, model, optimizer, scheduler, epoch, best_val_loss,
-                                               global_step=batch_idx_global, scaler=scaler)
-            resume_msg = f"Checkpoint saved to: {checkpoint_path} (resume point: epoch {epoch + 1}/{config.basemodel_epochs})"
+            checkpoint_path = save_checkpoint(
+                save_dir, model, optimizer, scheduler, epoch, best_val_loss,
+                global_step=batch_idx_global, scaler=scaler,
+            )
+            resume_msg = (
+                f"Checkpoint saved to: {checkpoint_path} "
+                f"(resume point: epoch {epoch + 1}/{config.basemodel_epochs})"
+            )
             logger.info(resume_msg)
             print(resume_msg)
 
@@ -511,9 +479,13 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description='Kronos Basemodel Fine-tuning Training (technical-indicator features)')
-    parser.add_argument('--config', type=str, default='config.yaml',
-                       help='Configuration file path (default: config.yaml)')
+    parser = argparse.ArgumentParser(
+        description='Kronos Basemodel Fine-tuning Training (technical-indicator features)'
+    )
+    parser.add_argument(
+        '--config', type=str, default='config.yaml',
+        help='Configuration file path (default: config.yaml)',
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -539,8 +511,9 @@ def main():
 
     tokenizer = tokenizer.to(device)
     model = model.to(device)
+    compiled_model = torch.compile(model)
 
-    model_size = sum(p.numel() for p in model.parameters())
+    model_size = sum(p.numel() for p in compiled_model.parameters())
     logger.info(f"Model parameters: {model_size:,}")
     print(f"Model parameters: {model_size:,}")
 
@@ -549,25 +522,31 @@ def main():
     logger.info(f"Feature list ({config.d_in} dims): {config.feature_list}")
     logger.info(f"Lookback window: {config.lookback_window}")
     logger.info(f"Predict window: {config.predict_window}")
-    logger.info(f"Batch size: {config.batch_size}")
+    logger.info(f"Batch size: {config.basemodel_batch_size}")
     logger.info(f"Learning rate: {config.predictor_learning_rate}")
     logger.info(f"Training epochs: {config.basemodel_epochs}")
     logger.info(f"Device: {device}")
     logger.info(f"Mixed precision (AMP): {config.use_amp} (dtype: {config.amp_dtype})")
+    logger.info(
+        f"Logic loss: enabled={config.logic_loss_enabled}, "
+        f"weight={config.logic_loss_weight}"
+    )
     logger.info(f"Tokenizer path: {config.finetuned_tokenizer_path}")
     logger.info(f"Pretrained model path: {config.pretrained_predictor_path}")
 
     logger.info("Starting fine-tuning training...")
     print("Starting fine-tuning training...")
-    best_val_loss = train_model(model, tokenizer, device, config, config.basemodel_save_path, logger)
+    best_val_loss = train_model(
+        compiled_model, tokenizer, device, config, config.basemodel_save_path, logger
+    )
 
-    final_msg = f"Training completed! Best validation loss: {best_val_loss:.4f}\nModel saved to: {config.basemodel_save_path}"
+    final_msg = (
+        f"Training completed! Best validation loss: {best_val_loss:.4f}\n"
+        f"Model saved to: {config.basemodel_save_path}"
+    )
     logger.info(final_msg)
     print(final_msg)
 
 
 if __name__ == "__main__":
-    import time
     main()
-else:
-    import time

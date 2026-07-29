@@ -9,21 +9,21 @@ data:
   # a training window is never built from more than one file. Adjust the
   # repo root if you cloned/uploaded Kronos somewhere other than
   # /kaggle/working/Kronos.
-  data_path: "/kaggle/input/datasets/thinhlt68/binance-kline/*_kline_5min.csv"
+  data_path: /content/drive/MyDrive/Kronos/data/*.csv
   # Equivalent explicit form, if you'd rather pin the exact symbol set:
   # data_path:
-  #   - "/kaggle/working/Kronos/finetune_ta/data/BTCUSDT_kline_5min.csv"
-  #   - "/kaggle/working/Kronos/finetune_ta/data/ETHUSDT_kline_5min.csv"
-  #   - "/kaggle/working/Kronos/finetune_ta/data/BNBUSDT_kline_5min.csv"
-  #   - "/kaggle/working/Kronos/finetune_ta/data/SOLUSDT_kline_5min.csv"
-  #   - "/kaggle/working/Kronos/finetune_ta/data/XRPUSDT_kline_5min.csv"
-  #   - "/kaggle/working/Kronos/finetune_ta/data/ADAUSDT_kline_5min.csv"
-  #   - "/kaggle/working/Kronos/finetune_ta/data/DOGEUSDT_kline_5min.csv"
-  #   - "/kaggle/working/Kronos/finetune_ta/data/TRXUSDT_kline_5min.csv"
-  #   - "/kaggle/working/Kronos/finetune_ta/data/ZECUSDT_kline_5min.csv"
-  #   - "/kaggle/working/Kronos/finetune_ta/data/AVAXUSDT_kline_5min.csv"
-  lookback_window: 512
-  predict_window: 48
+  #   - "/content/drive/MyDrive/Kronos/data/BTCUSDT_kline_5min.csv"
+  #   - "/content/drive/MyDrive/Kronos/data/ETHUSDT_kline_5min.csv"
+  #   - "/content/drive/MyDrive/Kronos/data/BNBUSDT_kline_5min.csv"
+  #   - "/content/drive/MyDrive/Kronos/data/SOLUSDT_kline_5min.csv"
+  #   - "/content/drive/MyDrive/Kronos/data/XRPUSDT_kline_5min.csv"
+  #   - "/content/drive/MyDrive/Kronos/data/ADAUSDT_kline_5min.csv"
+  #   - "/content/drive/MyDrive/Kronos/data/DOGEUSDT_kline_5min.csv"
+  #   - "/content/drive/MyDrive/Kronos/data/TRXUSDT_kline_5min.csv"
+  #   - "/content/drive/MyDrive/Kronos/data/ZECUSDT_kline_5min.csv"
+  #   - "/content/drive/MyDrive/Kronos/data/AVAXUSDT_kline_5min.csv"
+  lookback_window: 1024
+  predict_window: 64
   max_context: 512
   clip: 5.0
   # split ratio is applied PER FILE (each symbol contributes its own last
@@ -42,24 +42,25 @@ features:
     volume_sma: true
 
 training:
-  tokenizer_epochs: 30
-  basemodel_epochs: 20
-  # Tokenizer is lighter on memory -- use a larger batch. Basemodel (AR
-  # predictor) is heavier; keep it smaller to avoid OOM.
+  tokenizer_epochs: 3
+  basemodel_epochs: 10
+  # Tokenizer is lighter on memory -- use a larger batch. Soft-decode for
+  # logic loss adds VRAM on top of the basemodel CE path every epoch.
   tokenizer_batch_size: 256
-  basemodel_batch_size: 32
+  basemodel_batch_size: 24
   log_interval: 50
-  # Kaggle notebooks have 4 CPU cores; more workers than that just contend.
-  num_workers: 2
+  # Colab usually has 2–4 CPU cores; more workers just contend for host RAM.
+  num_workers: 12
   seed: 42
 
   tokenizer_learning_rate: 0.0002
-  predictor_learning_rate: 0.000001
+  predictor_learning_rate: 0.00008
 
   adam_beta1: 0.9
   adam_beta2: 0.95
   adam_weight_decay: 0.1
-  accumulation_steps: 1
+  # Effective CE batch ≈ basemodel_batch_size * accumulation_steps (64*2=128).
+  accumulation_steps: 2
 
   # Kaggle sessions are capped (~9-12h interactive, 30 GPU-hrs/week quota) and
   # /kaggle/working is wiped on a fresh session -- resume=true makes it safe
@@ -71,18 +72,30 @@ training:
   checkpoint_every_n_steps: 500
 
   # Mixed precision (AMP) training: speeds up training and reduces memory use
-  # on Kaggle's T4/P100 GPUs by running most ops in fp16. 'fp16' works on
-  # T4/P100 (uses gradient scaling); 'bf16' needs Ampere-or-newer, which
-  # Kaggle's free-tier GPUs are not, so leave this as 'fp16' there.
+  # on CUDA GPUs by running most ops in a lower-precision dtype. No effect on
+  # CPU. 'fp16' works on most GPUs (uses gradient scaling); 'bf16' needs
+  # Ampere-or-newer (RTX 30xx+/A100) but needs no scaling.
   use_amp: true
   amp_dtype: "fp16"
+
+  # Predictor-only candle self-consistency penalty (OHLC validity + Heikin-Ashi
+  # formula match). Soft-decodes s1/s2 logits through the frozen tokenizer so
+  # the penalty is differentiable. Applied every epoch when enabled.
+  logic_loss:
+    enabled: true
+    weight: 25
+    ohlc_weight: 2.0
+    ha_weight: 2.0
+    # VRAM mitigations for soft-decode:
+    max_timesteps: 256          # contiguous subsample before decode (keeps HA recurrence)
+    use_checkpoint: true        # activation checkpoint tokenizer decoder layers
 
 model_paths:
   pretrained_tokenizer: "NeoQuasar/Kronos-Tokenizer-base"
   pretrained_predictor: "NeoQuasar/Kronos-base"
 
-  exp_name: "kaggle_multi_symbol_5m_ta"
-  base_path: "/kaggle/working/Kronos/finetune_ta/finetuned/"
+  exp_name: "multi_symbol_5m_ta_norm"
+  base_path: "/content/drive/MyDrive/finetune_ta/finetuned/"
 
   base_save_path: ""
   finetuned_tokenizer: ""
@@ -100,10 +113,10 @@ model_paths:
   # On startup, if base_save_path has no progress yet, its contents are
   # copied in once so training resumes from the checkpoint as usual and new
   # checkpoints are written to the writable base_save_path.
-  resume_from_path: ""
+  resume_from_path: "/content/drive/MyDrive/finetune_ta/finetuned/multi_symbol_5m_ta_norm"
 
 experiment:
-  name: "kronos_kaggle_multi_symbol_ta"
+  name: "kronos_multi_symbol_5m_ta"
   description: "Multi-symbol (10 USDT pairs) technical-indicator finetune, tuned for Kaggle Notebook sessions"
   use_comet: false
 

@@ -5,18 +5,19 @@ import random
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data.distributed import DistributedSampler
 import datetime
 import logging
 from logging.handlers import RotatingFileHandler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from feature_normalize import normalize_features_torch
+
 sys.path.append("../")
-from finetune_base_model import CustomKlineDataset
 from config_loader import CustomFinetuneConfig
 from model_factory import build_initial_tokenizer
 from checkpoint_utils import find_checkpoint, load_checkpoint, save_checkpoint
+from dataloaders import create_dataloaders
 
 
 def set_seed(seed: int, rank: int = 0):
@@ -88,77 +89,13 @@ def setup_logging(exp_name: str, log_dir: str, rank: int = 0) -> logging.Logger:
     return logger
 
 
-def create_dataloaders(config):
-    from torch.utils.data import DataLoader
-
-    if not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0:
-        print("Creating tokenizer training data loaders...")
-
-    train_dataset = CustomKlineDataset(
-        data_paths=config.data_paths,
-        data_type="train",
-        lookback_window=config.lookback_window,
-        predict_window=config.predict_window,
-        clip=config.clip,
-        seed=config.seed,
-        train_ratio=config.train_ratio,
-        val_ratio=config.val_ratio,
-        test_ratio=config.test_ratio,
-        feature_list=config.feature_list,
-        enabled_indicators=config.enabled_indicators
-    )
-
-    val_dataset = CustomKlineDataset(
-        data_paths=config.data_paths,
-        data_type="val",
-        lookback_window=config.lookback_window,
-        predict_window=config.predict_window,
-        clip=config.clip,
-        seed=config.seed + 1,
-        train_ratio=config.train_ratio,
-        val_ratio=config.val_ratio,
-        test_ratio=config.test_ratio,
-        feature_list=config.feature_list,
-        enabled_indicators=config.enabled_indicators
-    )
-
-    use_ddp = dist.is_available() and dist.is_initialized()
-    train_sampler = DistributedSampler(train_dataset, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=True) if use_ddp else None
-    val_sampler = DistributedSampler(val_dataset, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=False, drop_last=False) if use_ddp else None
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=(train_sampler is None),
-        num_workers=config.num_workers,
-        pin_memory=True,
-        drop_last=True,
-        sampler=train_sampler
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=True,
-        drop_last=False,
-        sampler=val_sampler
-    )
-
-    if not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0:
-        print(f"Training set size: {len(train_dataset)}, Validation set size: {len(val_dataset)}")
-
-    return train_loader, val_loader, train_dataset, val_dataset, train_sampler, val_sampler
-
-
 def train_tokenizer(model, device, config, save_dir, logger):
     logger.info("Starting tokenizer training...")
     use_ddp = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if use_ddp else 0
     world_size = dist.get_world_size() if use_ddp else 1
 
-    train_loader, val_loader, train_dataset, val_dataset, train_sampler, val_sampler = create_dataloaders(config)
+    train_loader, val_loader, train_dataset, val_dataset, train_sampler, val_sampler = create_dataloaders(config, batch_size=config.tokenizer_batch_size)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -209,6 +146,12 @@ def train_tokenizer(model, device, config, save_dir, logger):
             print(msg)
         return best_val_loss
 
+    # Compile before DDP so model.module still unwraps to the (compiled) module.
+    logger.info("Compiling model with torch.compile...")
+    if rank == 0:
+        print("Compiling model with torch.compile...")
+    model = torch.compile(model)
+
     if use_ddp:
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
@@ -251,7 +194,9 @@ def train_tokenizer(model, device, config, save_dir, logger):
                 continue
 
             ori_batch_x = ori_batch_x.to(device, non_blocking=True)
-
+            ori_batch_x = normalize_features_torch(
+                ori_batch_x, config.feature_list, clip=config.clip
+            )
             current_batch_total_loss = 0.0
             for j in range(accumulation_steps):
                 start_idx = j * (ori_batch_x.shape[0] // accumulation_steps)
@@ -312,6 +257,9 @@ def train_tokenizer(model, device, config, save_dir, logger):
         with torch.no_grad():
             for ori_batch_x, _ in val_loader:
                 ori_batch_x = ori_batch_x.to(device, non_blocking=True)
+                ori_batch_x = normalize_features_torch(
+                    ori_batch_x, config.feature_list, clip=config.clip
+                )
                 with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                     zs, _, _, _ = (model.module if use_ddp else model)(ori_batch_x)
                 _, z = zs
@@ -382,8 +330,9 @@ def main():
     print(f"Initializing tokenizer (pre_trained={getattr(config, 'pre_trained_tokenizer', False)}, d_in={config.d_in})...")
     tokenizer = build_initial_tokenizer(config)
     tokenizer = tokenizer.to(device)
+    compiled_tokenizer = torch.compile(tokenizer)
 
-    model_size = get_model_size(tokenizer)
+    model_size = get_model_size(compiled_tokenizer)
     logger.info(f"Tokenizer parameters: {model_size}")
     print(f"Tokenizer parameters: {model_size}")
 
@@ -401,7 +350,7 @@ def main():
 
     logger.info("Starting tokenizer fine-tuning training...")
     print("Starting tokenizer fine-tuning training...")
-    best_val_loss = train_tokenizer(tokenizer, device, config, config.tokenizer_save_path, logger)
+    best_val_loss = train_tokenizer(compiled_tokenizer, device, config, config.tokenizer_save_path, logger)
 
     final_msg = f"Tokenizer training completed! Best validation loss: {best_val_loss:.4f}\nModel saved to: {config.tokenizer_save_path}"
     logger.info(final_msg)

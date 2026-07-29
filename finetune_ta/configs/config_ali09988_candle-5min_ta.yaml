@@ -18,16 +18,19 @@ data:
 # indicators.py -- only enable/disable is configurable here.
 features:
   indicators:
-    heikin_ashi: true   # adds ha_open, ha_high, ha_low, ha_close
+    heikin_ashi: true   # adds HA_open, HA_high, HA_low, HA_close
     kdj: true            # adds K_9_3, D_9_3, J_9_3
     macd: true            # adds MACD_12_26_9, MACDh_12_26_9, MACDs_12_26_9
-    bollinger: true        # adds BBB_20_2.0 (bandwidth), BBP_20_2.0 (%B)
+    bollinger: true        # adds BBM/BBU/BBL_20_2.0 (middle, upper, lower)
+    atr: true              # adds ATRr_14
+    volume_sma: true       # adds VOL_SMA_50 (avg volume over last 50 bars)
 
 training:
   # control the training epochs of tokenizer and basemodel
   tokenizer_epochs: 30
   basemodel_epochs: 20
-  batch_size: 32
+  tokenizer_batch_size: 256
+  basemodel_batch_size: 32
   log_interval: 50
   num_workers: 6
   seed: 42

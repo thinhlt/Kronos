@@ -1,10 +1,10 @@
 # Kronos Finetuning with Technical Indicators (`finetune_ta`)
 
-A finetuning pipeline for Kronos on a single OHLCV CSV, augmented with four
+A finetuning pipeline for Kronos on a single OHLCV CSV, augmented with
 technical indicators as extra feature channels: **KDJ**, **MACD**,
-**Heikin-Ashi**, and **Bollinger Bands**. Fully isolated from `finetune_csv/`
-and `finetune/` -- no shared config, data, or training code -- so it never
-interferes with those pipelines.
+**Heikin-Ashi**, **Bollinger Bands**, **ATR**, and **volume SMA**. Fully
+isolated from `finetune_csv/` and `finetune/` -- no shared config, data, or
+training code -- so it never interferes with those pipelines.
 
 See [`CONTEXT.md`](../CONTEXT.md) for terminology (Base Features vs.
 Technical Indicator Features, `d_in`, ...) and
@@ -19,10 +19,15 @@ for why the tokenizer is trained from scratch here.
 | Heikin-Ashi | `HA_open, HA_high, HA_low, HA_close` | Smoothed synthetic candles, alongside (not replacing) raw OHLC |
 | KDJ | `K_9_3, D_9_3, J_9_3` | length=9, signal=3 |
 | MACD | `MACD_12_26_9, MACDh_12_26_9, MACDs_12_26_9` | fast=12, slow=26, signal=9 |
-| Bollinger | `BBB_20_2.0, BBP_20_2.0` | bandwidth + %B only (scale-free); length=20, std=2.0 |
+| Bollinger | `BBM_20_2.0, BBU_20_2.0, BBL_20_2.0` | middle, upper, lower; length=20, std=2.0 |
+| ATR | `ATRr_14` | Average True Range (Wilder); length=14 |
+| Volume SMA | `VOL_SMA_50` | rolling mean of volume over last 50 bars |
 
-All 18 columns are normalized identically: per-window z-score + clip, exactly
-like the existing `finetune_csv` pipeline (see `data.clip` in the config).
+All 21 columns are normalized on GPU after each training batch is transferred
+(not on disk, and not in ``Dataset.__getitem__``): OHLC / Heikin-Ashi /
+Bollinger / ATR are divided by the window's first open; MACD is `(value / open)`
+then per-window z-score; KDJ, volume, amount, and volume SMA are per-window
+z-score only; then clip (see `data.clip` and `feature_normalize.py`).
 Toggle indicators on/off via the `features.indicators` block in the YAML
 config; each indicator's internal parameters are fixed (not config-driven)
 -- see `indicators.py`.
@@ -43,6 +48,20 @@ daily archives, indicators included in one final file):
 
 ```bash
 python download_input_predict_data.py --symbols BTCUSDT ADAUSDT
+# -> data/{SYMBOL}_kline_5min.csv
+
+# When yesterday's Vision ZIP is late / you need bars through the last closed
+# 5m candle: merge a short daily history with REST API fill, cap at 2000 bars.
+python download_input_predict_data.py --symbols BTCUSDT ADAUSDT --live
+python download_input_predict_data.py --symbols BTCUSDT --live --max-bars 1500
+```
+
+For a short **last-7-days** prediction window (REST API only, TA features
+included):
+
+```bash
+python download_last_7d.py
+python download_last_7d.py --symbols BTCUSDT ETHUSDT
 # -> data/{SYMBOL}_kline_5min.csv
 ```
 
@@ -114,10 +133,12 @@ rather than attempting exact mid-epoch resumption. See
 
 Set `training.use_amp: true` to run most ops in a lower-precision dtype on
 CUDA GPUs, which typically speeds up training and cuts memory use (letting
-you raise `batch_size`). It has no effect when training on CPU.
+you raise `tokenizer_batch_size` / `basemodel_batch_size`). It has no effect when training on CPU.
 
 ```yaml
 training:
+  tokenizer_batch_size: 256   # tokenizer is lighter; raise if VRAM allows
+  basemodel_batch_size: 32    # predictor is heavier; keep smaller to avoid OOM
   use_amp: true
   amp_dtype: "fp16"   # or "bf16" on Ampere-or-newer GPUs (RTX 30xx+/A100)
 ```
@@ -128,6 +149,30 @@ gradient scaling (`torch.cuda.amp.GradScaler`) to avoid gradient underflow;
 state is included in `checkpoint_last.pt`, so resuming an AMP run doesn't
 reset its warmup. You can also override the config from the command line
 with `--amp` / `--no-amp` on `train_sequential.py`.
+
+Legacy single `training.batch_size` still works as a fallback for both phases
+when the phase-specific keys are omitted.
+
+## Predictor candle logic loss
+
+Optional self-consistency penalty on the **basemodel only** (tokenizer train
+unchanged). Soft-decodes s1/s2 logits through the frozen tokenizer decoder and
+penalizes invalid OHLC envelopes and Heikin-Ashi formula mismatches. No gap
+term; no supervised continuous MSE for these penalties.
+
+```yaml
+training:
+  logic_loss:
+    enabled: true              # CE + logic on every epoch when true
+    weight: 0.1
+    ohlc_weight: 1.0
+    ha_weight: 1.0
+    # VRAM mitigations (soft-decode is otherwise very heavy at lookback=1024):
+    max_timesteps: 128         # contiguous window subsample before decode
+    use_checkpoint: true       # checkpoint frozen tokenizer decoder layers
+```
+
+Validation / best-model selection stays CE-only.
 
 ## Running on Kaggle
 
@@ -251,3 +296,27 @@ pred_df = predictor.predict(df, x_timestamp, y_timestamp, pred_len=48)
 `pred_df` contains predictions for all 18 feature columns (not just
 OHLCV) -- the model was trained to jointly forecast raw prices and their
 derived indicators.
+
+## Walk-forward backtest
+
+`backtest.py` runs forecast windows on each file's validation split
+(last `val_ratio` of bars), scores horizon-end close error / direction
+accuracy, and simulates a simple long-if-pred-up strategy. Per-experiment
+wrappers pin the two multi-symbol runs (default `--pred-len 48` with
+`--stride 288` for tractable runtime; training used 288):
+
+```bash
+python backtest_multi_symbol_5m_ta.py
+python backtest_multi_symbol_5m_ta_norm.py
+
+# quick smoke (2 windows on one symbol)
+python backtest_multi_symbol_5m_ta.py \
+  --input data/BTCUSDT_kline_5min.csv --max-windows 2
+
+# full training horizon (slow: ~30m/window on CPU/MPS)
+python backtest_multi_symbol_5m_ta.py --pred-len 288 --stride 288 \
+  --input data/BTCUSDT_kline_5min.csv --max-windows 1
+```
+
+Results land under `backtests/<exp_name>/` (`summary.json`, per-symbol
+`*_windows.csv`, charts).

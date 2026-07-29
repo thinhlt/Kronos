@@ -204,7 +204,14 @@ class CustomFinetuneConfig:
         if 'epochs' in training_config and 'basemodel_epochs' not in training_config:
             self.basemodel_epochs = training_config.get('epochs', 30)
 
-        self.batch_size = training_config.get('batch_size', 160)
+        # Phase-specific batch sizes (tokenizer can be much larger; basemodel
+        # is memory-heavier). Legacy `batch_size` is the fallback for both when
+        # the phase-specific key is omitted.
+        legacy_batch_size = training_config.get('batch_size', 160)
+        self.tokenizer_batch_size = training_config.get('tokenizer_batch_size', legacy_batch_size)
+        self.basemodel_batch_size = training_config.get('basemodel_batch_size', legacy_batch_size)
+        # Kept for callers/logs that still read a single batch_size.
+        self.batch_size = legacy_batch_size
         self.log_interval = training_config.get('log_interval', 50)
         self.num_workers = training_config.get('num_workers', 6)
         self.seed = training_config.get('seed', 100)
@@ -227,6 +234,17 @@ class CustomFinetuneConfig:
         # be cut off (e.g. Kaggle/Colab time limits).
         self.resume = training_config.get('resume', True)
         self.checkpoint_every_n_steps = training_config.get('checkpoint_every_n_steps', 0)
+
+        # Predictor-only candle logic loss (OHLC / Heikin-Ashi self-consistency).
+        # Applied on every epoch when enabled (same CE + logic config throughout).
+        logic_cfg = training_config.get('logic_loss') or {}
+        self.logic_loss_enabled = bool(logic_cfg.get('enabled', False))
+        self.logic_loss_weight = float(logic_cfg.get('weight', 0.1))
+        self.logic_loss_ohlc_weight = float(logic_cfg.get('ohlc_weight', 1.0))
+        self.logic_loss_ha_weight = float(logic_cfg.get('ha_weight', 1.0))
+        # VRAM mitigations for soft-decode.
+        self.logic_loss_max_timesteps = int(logic_cfg.get('max_timesteps', 128))
+        self.logic_loss_use_checkpoint = bool(logic_cfg.get('use_checkpoint', True))
 
         model_paths = self.loader.get_model_paths()
         self.exp_name = model_paths.get('exp_name', 'default_experiment')
@@ -286,7 +304,7 @@ class CustomFinetuneConfig:
             'val_ratio': self.val_ratio,
             'test_ratio': self.test_ratio,
             'epochs': self.tokenizer_epochs,
-            'batch_size': self.batch_size,
+            'batch_size': self.tokenizer_batch_size,
             'log_interval': self.log_interval,
             'num_workers': self.num_workers,
             'seed': self.seed,
@@ -316,7 +334,7 @@ class CustomFinetuneConfig:
             'val_ratio': self.val_ratio,
             'test_ratio': self.test_ratio,
             'epochs': self.basemodel_epochs,
-            'batch_size': self.batch_size,
+            'batch_size': self.basemodel_batch_size,
             'log_interval': self.log_interval,
             'num_workers': self.num_workers,
             'seed': self.seed,
@@ -345,7 +363,8 @@ class CustomFinetuneConfig:
         print(f"Predict window: {self.predict_window}")
         print(f"Tokenizer training epochs: {self.tokenizer_epochs}")
         print(f"Basemodel training epochs: {self.basemodel_epochs}")
-        print(f"Batch size: {self.batch_size}")
+        print(f"Tokenizer batch size: {self.tokenizer_batch_size}")
+        print(f"Basemodel batch size: {self.basemodel_batch_size}")
         print(f"Tokenizer learning rate: {self.tokenizer_learning_rate}")
         print(f"Predictor learning rate: {self.predictor_learning_rate}")
         print(f"Train tokenizer: {self.train_tokenizer}")
